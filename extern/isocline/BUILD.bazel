@@ -1,0 +1,20 @@
+load("@rules_cc//cc:cc_library.bzl", "cc_library")
+
+cc_library(
+    name = "isocline",
+    srcs = ["src/isocline.c"],
+    hdrs = ["include/isocline.h"],
+    copts = ["-Wno-unused-function"],
+    includes = [
+        "include",
+        "src",
+    ],
+    textual_hdrs = glob(
+        [
+            "src/**/*.c",
+            "src/**/*.h",
+        ],
+        exclude = ["src/isocline.c"],
+    ),
+    visibility = ["//visibility:public"],
+)

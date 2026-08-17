@@ -1,0 +1,6 @@
+build --cxxopt=-Wall
+build --cxxopt=-Wimplicit-fallthrough
+build --cxxopt=-Wsign-compare
+build --cxxopt=-Wno-unused
+build --cxxopt=-Wno-maybe-uninitialized
+build:werror --cxxopt=-Werror

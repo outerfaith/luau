@@ -1,0 +1,31 @@
+load("@rules_cc//cc:cc_library.bzl", "cc_library")
+
+cc_library(
+    name = "vm",
+    srcs = glob([
+        "src/**/*.cpp",
+        "src/**/*.h",
+    ]),
+    hdrs = glob(["include/**/*.h"]),
+    copts = [
+        "-fno-math-errno",
+    ],
+    includes = ["include"],
+    linkstatic = True,
+    visibility = ["//visibility:public"],
+    deps = [
+        "//Common:common",
+    ],
+)
+
+cc_library(
+    name = "internals",
+    hdrs = glob(["src/**/*.h"]),
+    includes = ["src"],
+    linkstatic = True,
+    visibility = [
+        "//CodeGen:__pkg__",
+        "//Inliner:__pkg__",
+        "//tests:__pkg__",
+    ],
+)
