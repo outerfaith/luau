@@ -26,6 +26,7 @@ cc_library(
     visibility = [
         "//CodeGen:__pkg__",
         "//Inliner:__pkg__",
+        "//Jit:__pkg__",
         "//tests:__pkg__",
     ],
 )

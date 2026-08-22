@@ -171,6 +171,7 @@ struct lua_ExecutionCallbacks
         size_t* count
     ); // called to get the execution counter data and count {uint32_t, uint32_t, uint64_t}
     Proto* (*inlinefunction)(lua_State* L, Closure* caller, Closure* target, uint32_t pc); // called when inlining threshold is reached
+    void (*hot)(lua_State* L, Proto* proto); // called when a function's call count reaches the native compilation threshold
 };
 
 struct lua_UdataDirectAccessData

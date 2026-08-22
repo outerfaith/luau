@@ -36,6 +36,7 @@ cc_test(
         "IrBuilder.test.cpp",
         "IrCallWrapperX64.test.cpp",
         "IrRegAllocX64.test.cpp",
+        "Jit.test.cpp",
         "JsonEmitter.test.cpp",
         "LValue.test.cpp",
         "Lexer.test.cpp",
@@ -112,6 +113,10 @@ cc_test(
         "//Bytecode:bytecode",
         "//CodeGen:codegen",
         "//Compiler:compiler",
+        "//Jit:internals",
+        "//Jit:jit",
+        "//VM:internals",
+        "//VM:vm",
         "//extern:doctest",
     ],
 )

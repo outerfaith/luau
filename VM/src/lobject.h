@@ -424,6 +424,7 @@ typedef struct Proto
     FeedbackVectorSlot* feedbackvec;
     uint32_t feedbackvecsize;
     uint32_t funid;
+    uint32_t hits;
     Proto* optimized;
     Proto* deoptimized;
     uint64_t cost;

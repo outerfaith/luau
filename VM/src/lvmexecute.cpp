@@ -25,6 +25,8 @@ LUAU_FLAGVERSION(LuauBackedgeHeapCheck, 2)
 LUAU_FASTFLAG(LuauFastpcall)
 LUAU_FASTFLAGVARIABLE(LuauFastpcallInterrupt)
 
+LUAU_FASTINTVARIABLE(LuauNativeHitsThreshold, 1000)
+
 // Disable c99-designator to avoid the warning in computed goto dispatch table
 #ifdef __clang__
 #if __has_warning("-Wc99-designator")
@@ -1102,6 +1104,13 @@ reentry:
                         setnilvalue(argi++); // complete missing arguments
                     L->top = p->is_vararg ? argi : ci->top;
 
+#if VM_HAS_NATIVE
+                    // the function becomes a candidate for native compilation once it has been called often enough; the callback may install native
+                    // code, which the codeentry read below then picks up for this very call
+                    if (LUAU_UNLIKELY(++p->hits == uint32_t(FInt::LuauNativeHitsThreshold)) && L->global->ecb.hot)
+                        L->global->ecb.hot(L, p);
+#endif
+
                     // reentry
                     // codeentry may point to NATIVECALL instruction when proto is compiled to native code
                     // this will result in execution continuing in native code, and is equivalent to if (p->execdata) but has no additional overhead
@@ -1210,6 +1219,13 @@ reentry:
                     while (argi < argend)
                         setnilvalue(argi++); // complete missing arguments
                     L->top = p->is_vararg ? argi : ci->top;
+
+#if VM_HAS_NATIVE
+                    // the function becomes a candidate for native compilation once it has been called often enough; the callback may install native
+                    // code, which the codeentry read below then picks up for this very call
+                    if (LUAU_UNLIKELY(++p->hits == uint32_t(FInt::LuauNativeHitsThreshold)) && L->global->ecb.hot)
+                        L->global->ecb.hot(L, p);
+#endif
 
                     // reentry
                     // codeentry may point to NATIVECALL instruction when proto is compiled to native code
@@ -3920,6 +3936,11 @@ int luau_precall(lua_State* L, StkId func, int nresults)
         ci->savedpc = p->code;
 
 #if VM_HAS_NATIVE
+        // the function becomes a candidate for native compilation once it has been called often enough; the callback may install native code, which
+        // the test below then picks up for this very call
+        if (LUAU_UNLIKELY(++p->hits == uint32_t(FInt::LuauNativeHitsThreshold)) && L->global->ecb.hot)
+            L->global->ecb.hot(L, p);
+
         if (p->exectarget != 0 && p->execdata)
             ci->flags = LUA_CALLINFO_NATIVE;
 #endif

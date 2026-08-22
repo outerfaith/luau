@@ -57,6 +57,7 @@ Proto* luaF_newproto(lua_State* L)
     f->feedbackvec = NULL;
     f->feedbackvecsize = 0;
     f->funid = 0;
+    f->hits = 0;
     f->optimized = nullptr;
     f->deoptimized = nullptr;
     f->cost = 0;
