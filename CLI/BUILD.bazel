@@ -44,6 +44,7 @@ cc_binary(
         "//Compiler:compiler",
         "//Config:config",
         "//Inliner:inliner",
+        "//Jit:jit",
         "//Require:require",
         "//VM:vm",
         "//extern:osthreads",

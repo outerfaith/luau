@@ -21,9 +21,7 @@
 #include <llvm/Support/TargetSelect.h>
 #include <llvm/TargetParser/Host.h>
 
-LUAU_FASTFLAGVARIABLE(LuauJitDumpIr)
-
-LUAU_FASTFLAG(LuauCIProto)
+LUAU_FASTFLAGVARIABLE(DebugLuauJitDumpIr)
 
 namespace Luau::Jit
 {
@@ -251,9 +249,7 @@ void JitContext::on_disable(lua_State* L, Proto* proto)
             {
                 if (isLua(ci))
                 {
-                    Proto* p = FFlag::LuauCIProto ? ci->p : clvalue(ci->func)->l.p;
-
-                    if (p == proto)
+                    if (ci->p == proto)
                         ci->flags &= ~LUA_CALLINFO_NATIVE;
                 }
             }
@@ -347,7 +343,7 @@ JITCompilationResult JitContext::compile(Proto* proto)
 
         if (result == JITCompilationResult::Success)
         {
-            if (FFlag::LuauJitDumpIr)
+            if (FFlag::DebugLuauJitDumpIr)
             {
                 llvm::errs() << "; luaujit: " << name << " before optimization\n";
                 module->print(llvm::errs(), nullptr);
@@ -355,7 +351,7 @@ JITCompilationResult JitContext::compile(Proto* proto)
 
             optimize_module(*module, nproto->stats.tier);
 
-            if (FFlag::LuauJitDumpIr)
+            if (FFlag::DebugLuauJitDumpIr)
             {
                 llvm::errs() << "; luaujit: " << name << " after optimization\n";
                 module->print(llvm::errs(), nullptr);

@@ -15,6 +15,7 @@
 #include "Luau/Frontend.h"
 #include "Luau/Compiler.h"
 #include "Luau/CodeGen.h"
+#include "Luau/JitCompiler.h"
 #include "Luau/BytecodeSummary.h"
 #include "Luau/BytecodeDump.h"
 #include "Luau/Parser.h"
@@ -43,6 +44,7 @@
 extern bool verbose;
 extern bool codegen;
 extern bool jitInliner;
+extern bool jit;
 extern int optimizationLevel;
 
 // internal functions, declared in lgc.h - not exposed via lua.h
@@ -58,6 +60,7 @@ LUAU_FASTFLAG(DebugLuauAbortingChecks)
 LUAU_FASTFLAG(LuauBytecodeFold)
 LUAU_FASTFLAG(LuauEmitCallFeedback)
 LUAU_FASTINT(CodegenHeuristicsInstructionLimit)
+LUAU_FASTINT(LuauNativeHitsThreshold)
 LUAU_FASTFLAG(LuauTableArrayAdjustCheck)
 LUAU_FASTFLAG(LuauIntegerLibrary)
 LUAU_FASTFLAG(LuauIntegerType2)
@@ -335,6 +338,12 @@ static StateRef runConformance(
     if (codegen && !skipCodegen && luau_codegen_supported())
         luau_codegen_create(L);
 
+    const bool useJit = jit && !skipCodegen && Luau::Jit::is_supported();
+    ScopedFastInt jitThreshold(FInt::LuauNativeHitsThreshold, useJit ? 1 : FInt::LuauNativeHitsThreshold.value);
+
+    if (useJit)
+        Luau::Jit::create(L);
+
     if (jitInliner)
         luau_enable_jit_inliner(L);
 
@@ -392,6 +401,9 @@ static StateRef runConformance(
     free(bytecode);
 
     Luau::CodeGen::CompilationOptions nativeOpts = codegenOptions ? *codegenOptions : defaultCodegenOptions();
+
+    if (result == 0 && useJit)
+        CHECK(Luau::Jit::compile(L, -1) == Luau::Jit::JITCompilationResult::Success);
 
     if (result == 0 && codegen && !skipCodegen && luau_codegen_supported())
     {
@@ -4867,28 +4879,30 @@ TEST_CASE("NativeUserdata")
         "native_userdata.luau",
         [](lua_State* L)
         {
-            Luau::CodeGen::setUserdataRemapper(
-                L,
-                kUserdataRunTypes,
-                [](void* context, const char* str, size_t len) -> uint8_t
-                {
-                    const char** types = (const char**)context;
-
-                    uint8_t index = 0;
-
-                    std::string_view sv{str, len};
-
-                    for (; *types; ++types)
+            // the remapper assumes that ecb.context belongs to CodeGen, which isn't the case under the jit
+            if (codegen)
+                Luau::CodeGen::setUserdataRemapper(
+                    L,
+                    kUserdataRunTypes,
+                    [](void* context, const char* str, size_t len) -> uint8_t
                     {
-                        if (sv == *types)
-                            return index;
+                        const char** types = (const char**)context;
 
-                        index++;
+                        uint8_t index = 0;
+
+                        std::string_view sv{str, len};
+
+                        for (; *types; ++types)
+                        {
+                            if (sv == *types)
+                                return index;
+
+                            index++;
+                        }
+
+                        return 0xff;
                     }
-
-                    return 0xff;
-                }
-            );
+                );
 
             setupVectorHelpers(L);
             setupUserdataHelpers(L);

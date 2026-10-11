@@ -49,6 +49,9 @@ int optimizationLevel = 1;
 // Run conformance tests with native code generation
 bool codegen = false;
 
+// Run conformance tests with the LLVM JIT, compiling every function on its first call
+bool jit = false;
+
 // Something to seed a pseudorandom number generator with
 std::optional<unsigned> randomSeed;
 
@@ -556,6 +559,9 @@ int main(int argc, char** argv)
 
     if (doctest::parseFlag(argc, argv, "--codegen"))
         codegen = true;
+
+    if (doctest::parseFlag(argc, argv, "--jit"))
+        jit = true;
 
     if (doctest::parseFlag(argc, argv, "--jit-inliner"))
         jitInliner = true;

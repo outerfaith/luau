@@ -1533,7 +1533,21 @@ void analyze_bytecode_types(BytecodeFunction& function, const HostHooks& hostHoo
             case LOP_FORGPREP:
             case LOP_NEWCLASS:
             case LOP_NEWCLASSMEMBER:
+            case LOP_FASTPCALL:
+            case LOP_FINCONSTRUCT:
+            case LOP_CMPPROTO:
+            case LOP_BREAK:
                 break;
+            case LOP_CONSTRUCT:
+            {
+                int ra = LUAU_INSN_A(*pc);
+
+                regTags[ra] = LBC_TYPE_OBJECT;
+                bcType.result = regTags[ra];
+
+                refine_reg_type(bcTypeInfo, ra, i, bcType.result);
+                break;
+            }
             default:
                 LUAU_ASSERT(!"Unknown instruction");
             }

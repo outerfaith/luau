@@ -189,6 +189,10 @@ void visit_bytecode_reg_defs_uses(T& visitor, Proto* proto, const int pcpos)
         // paired with; that CALL is always part of the same basic block, so only the arguments that are spelled out
         // in the fastcall itself have to be reported here
     case LOP_FASTCALL:
+    case LOP_FASTPCALL:
+        break;
+    case LOP_FINCONSTRUCT:
+        visitor.use(ra);
         break;
     case LOP_FASTCALL1:
     case LOP_FASTCALL2K:
@@ -267,6 +271,11 @@ void visit_bytecode_reg_defs_uses(T& visitor, Proto* proto, const int pcpos)
     case LOP_NEWCLASSMEMBER:
         visitor.use(ra);
         visitor.use(rc);
+        break;
+    case LOP_CONSTRUCT:
+        visitor.use(rb);
+
+        visitor.def(ra);
         break;
 
     case LOP_NATIVECALL:

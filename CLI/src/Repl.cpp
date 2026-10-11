@@ -14,6 +14,7 @@
 #include "Luau/Coverage.h"
 #include "Luau/FileUtils.h"
 #include "Luau/Flags.h"
+#include "Luau/JitCompiler.h"
 #include "Luau/JitInliner.h"
 #include "Luau/Profiler.h"
 #include "Luau/ReplRequirer.h"
@@ -46,11 +47,14 @@
 #include <stdlib.h>
 
 LUAU_FASTFLAG(DebugLuauTimeTracing)
+LUAU_FASTINT(LuauNativeHitsThreshold)
 
 constexpr int MaxTraversalLimit = 50;
 
 static bool codegen = false;
 static bool codegenCold = false;
+static bool jit = false;
+static bool jitCold = false;
 static bool jitInliner = false;
 static int program_argc = 0;
 char** program_argv = nullptr;
@@ -207,6 +211,9 @@ void setupState(lua_State* L)
 {
     if (codegen)
         Luau::CodeGen::create(L);
+
+    if (jit)
+        Luau::Jit::create(L);
 
     if (jitInliner)
         Luau::JitInliner::setup(L);
@@ -623,6 +630,10 @@ static bool runFile(const char* name, lua_State* GL, bool repl)
             Luau::CodeGen::compile(L, -1, nativeOptions);
         }
 
+        // the main chunk only runs once, so it never gets hot by itself
+        if (jit && jitCold)
+            Luau::Jit::compile(L, -1);
+
         if (coverageActive())
             coverageTrack(L, -1);
 
@@ -682,6 +693,8 @@ static void displayHelp(const char* argv0)
     printf("  --codegen: execute code using native code generation\n");
     printf("  --codegen-cold: execute code using native code generation, including any functions deemed not profitable to natively compile\n");
     printf("  --codegen-perf: execute code using native code generation and profile using perf (only on Linux)\n");
+    printf("  --jit: execute code using the LLVM JIT, compiling functions once they get hot\n");
+    printf("  --jit-cold: execute code using the LLVM JIT, compiling every function on its first call\n");
     printf("  --program-args,-a: declare start of arguments to be passed to the Luau program\n");
     printf("  --fflags=<flags>: comma-separated list of fast flags to enable/disable (--fflags=true,false,LuauFlag1=true,LuauFlag2=false).\n");
     printf("  --jit-inliner: enable JIT bytecode inliner\n");
@@ -761,6 +774,15 @@ int replMain(int argc, char** argv)
             codegen = true;
             codegenPerf = true;
         }
+        else if (strcmp(argv[i], "--jit") == 0)
+        {
+            jit = true;
+        }
+        else if (strcmp(argv[i], "--jit-cold") == 0)
+        {
+            jit = true;
+            jitCold = true;
+        }
         else if (strcmp(argv[i], "--coverage") == 0)
         {
             coverage = true;
@@ -830,8 +852,23 @@ int replMain(int argc, char** argv)
 #endif
     }
 
+    if (codegen && jit)
+    {
+        fprintf(stderr, "--codegen and --jit can't be used together\n");
+        return 1;
+    }
+
     if (codegen && !Luau::CodeGen::isSupported())
         fprintf(stderr, "Warning: Native code generation is not supported in current configuration\n");
+
+    if (jit && !Luau::Jit::is_supported())
+    {
+        fprintf(stderr, "Warning: the JIT is not supported in current configuration\n");
+        jit = false;
+    }
+
+    if (jitCold)
+        FInt::LuauNativeHitsThreshold.value = 1;
 
     const std::vector<std::string> files = getSourceFiles(argc, argv);
 
