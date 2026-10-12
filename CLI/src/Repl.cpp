@@ -695,6 +695,7 @@ static void displayHelp(const char* argv0)
     printf("  --codegen-perf: execute code using native code generation and profile using perf (only on Linux)\n");
     printf("  --jit: execute code using the LLVM JIT, compiling functions once they get hot\n");
     printf("  --jit-cold: execute code using the LLVM JIT, compiling every function on its first call\n");
+    printf("  --jit-perf: execute code using the LLVM JIT and write a perf map for generated code (only on Linux)\n");
     printf("  --program-args,-a: declare start of arguments to be passed to the Luau program\n");
     printf("  --fflags=<flags>: comma-separated list of fast flags to enable/disable (--fflags=true,false,LuauFlag1=true,LuauFlag2=false).\n");
     printf("  --jit-inliner: enable JIT bytecode inliner\n");
@@ -777,6 +778,11 @@ int replMain(int argc, char** argv)
         else if (strcmp(argv[i], "--jit") == 0)
         {
             jit = true;
+        }
+        else if (strcmp(argv[i], "--jit-perf") == 0)
+        {
+            jit = true;
+            setLuauFlags("DebugLuauJitPerfMap=true");
         }
         else if (strcmp(argv[i], "--jit-cold") == 0)
         {

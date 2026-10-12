@@ -431,4 +431,74 @@ RegisterSet compute_live_in_at(const BytecodeFunction& function, const int pcpos
     return liveRs;
 }
 
+static std::bitset<256> flatten(const RegisterSet& rs)
+{
+    std::bitset<256> regs = rs.regs;
+
+    if (rs.varargSeq)
+        regs |= ~std::bitset<256>() << rs.varargStart;
+
+    return regs;
+}
+
+PcLiveness compute_pc_liveness(const BytecodeFunction& function)
+{
+    const Proto* proto = function.proto;
+    const CfgInfo& info = function.cfg;
+
+    PcLiveness result;
+    result.in.resize(proto->sizecode);
+    result.out.resize(proto->sizecode);
+
+    for (size_t blockIdx = 0; blockIdx < function.bcBlocks.size(); blockIdx++)
+    {
+        const auto& [startpc, finishpc] = function.bcBlocks[blockIdx];
+
+        std::vector<int> starts;
+        for (int i = startpc; i <= finishpc; i += getOpLength(static_cast<LuauOpcode>(LUAU_INSN_OP(proto->code[i]))))
+            starts.push_back(i);
+
+        RegisterSet live = info.out[blockIdx];
+
+        for (auto it = starts.rbegin(); it != starts.rend(); ++it)
+        {
+            const int pcpos = *it;
+            const Instruction insn = proto->code[pcpos];
+
+            std::bitset<256> skipIn;
+
+            if (isFastCall(static_cast<LuauOpcode>(LUAU_INSN_OP(insn))))
+            {
+                const int target = getJumpTarget(insn, static_cast<uint32_t>(pcpos));
+                LUAU_ASSERT(target > pcpos);
+
+                if (target <= finishpc)
+                    skipIn = result.in[target];
+                else if (const uint32_t targetIdx = info.blockAtPc[target]; function.bcBlocks[targetIdx].startpc == target)
+                    skipIn = flatten(info.in[targetIdx]);
+                else
+                    skipIn.set();
+            }
+
+            result.out[pcpos] = flatten(live) | skipIn;
+
+            RegisterSet defRs;
+            std::bitset<256> capturedRegs;
+            RegisterSet liveRs = compute_range_live_in_reg_set(function, pcpos, pcpos, defRs, capturedRegs);
+
+            liveRs.regs |= live.regs & ~defRs.regs;
+
+            if (live.varargSeq)
+                require_variadic_sequence(liveRs, defRs, live.varargStart);
+
+            live = liveRs;
+
+            // the fastcall itself defines nothing, so whatever the skip target reads is read before it as well
+            result.in[pcpos] = flatten(live) | skipIn;
+        }
+    }
+
+    return result;
+}
+
 } // namespace Luau::Jit

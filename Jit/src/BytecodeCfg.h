@@ -82,4 +82,15 @@ void compute_cfg_live_in_out_reg_sets(BytecodeFunction& function);
 void compute_cfg_info(BytecodeFunction& function);
 RegisterSet compute_live_in_at(const BytecodeFunction& function, int pcpos);
 
+struct PcLiveness
+{
+    // indexed by pc, for the first word of every instruction
+    std::vector<std::bitset<256>> in;
+    std::vector<std::bitset<256>> out;
+};
+
+// The registers live before and after every instruction, with a variadic sequence counted as every register from its
+// start upwards. The skip target of a fastcall counts as one of its successors, even though skipping isn't a CFG edge
+PcLiveness compute_pc_liveness(const BytecodeFunction& function);
+
 } // namespace Luau::Jit

@@ -23,6 +23,8 @@ struct VmTypes
     llvm::IntegerType* i64Ty = nullptr;
     llvm::Type* floatTy = nullptr;
     llvm::Type* doubleTy = nullptr;
+    // the components of a vector TValue, which start at its value and run into its extra field
+    llvm::FixedVectorType* vectorTy = nullptr;
     llvm::PointerType* ptrTy = nullptr;
 
     llvm::StructType* tvalueTy = nullptr;

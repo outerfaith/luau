@@ -21,6 +21,7 @@ VmTypes::VmTypes(llvm::LLVMContext& context)
     i64Ty = llvm::Type::getInt64Ty(context);
     floatTy = llvm::Type::getFloatTy(context);
     doubleTy = llvm::Type::getDoubleTy(context);
+    vectorTy = llvm::FixedVectorType::get(floatTy, LUA_VECTOR_SIZE);
     ptrTy = llvm::PointerType::getUnqual(context);
 
     // The 'value' union is modeled as an opaque 64-bit blob; accessors reinterpret it as needed

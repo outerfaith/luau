@@ -99,6 +99,11 @@ static bool interrupt(lua_State* L, const Instruction* pc)
     return false;
 }
 
+const TValue* get_fast_tm(lua_State* L, LuaTable* mt, int event)
+{
+    return fasttm(L, mt, TMS(event));
+}
+
 int execute_interrupt(lua_State* L, const Instruction* pc)
 {
     return interrupt(L, pc) ? 1 : 0;

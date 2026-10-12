@@ -21,6 +21,7 @@ LUAU_FASTFLAG(LuauFrozenMetaButterfly)
 LUAU_FASTFLAG(DebugLuauUserDefinedClassesRuntime)
 LUAU_FASTFLAG(LuauPromoteProto)
 LUAU_FASTFLAGVARIABLE(LuauCallLuauTm)
+LUAU_FASTINT(LuauNativeHitsThreshold)
 
 const TValue* luaV_tonumber(const TValue* obj, TValue* n)
 {
@@ -86,6 +87,11 @@ static LUAU_FORCEINLINE void callTMluau(lua_State* L, StkId top, Closure* ccl, i
     while (argi < argend)
         setnilvalue(argi++);
     L->top = p->is_vararg ? argi : ci->top;
+
+    // like luau_precall, which this bypasses: a metamethod becomes a candidate for native compilation once it has been
+    // called often enough, and the callback may install native code for this very call
+    if (LUAU_UNLIKELY(++p->hits == uint32_t(FInt::LuauNativeHitsThreshold)) && L->global->ecb.hot)
+        L->global->ecb.hot(L, p);
 
     if (p->exectarget != 0 && p->execdata)
         ci->flags |= LUA_CALLINFO_NATIVE;

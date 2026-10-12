@@ -22,6 +22,10 @@
 #include <llvm/TargetParser/Host.h>
 
 LUAU_FASTFLAGVARIABLE(DebugLuauJitDumpIr)
+LUAU_FASTFLAGVARIABLE(DebugLuauJitCounters)
+LUAU_FASTFLAGVARIABLE(DebugLuauJitPerfMap)
+LUAU_FASTFLAGVARIABLE(DebugLuauJitDumpObjects)
+LUAU_FASTINTVARIABLE(LuauJitExitRecompileThreshold, 64)
 
 namespace Luau::Jit
 {
@@ -32,6 +36,12 @@ static constexpr Instruction kCodeEntryInsn = LOP_NATIVECALL;
 JitContext::JitContext(std::unique_ptr<llvm::orc::LLJIT> jit)
     : m_jit(std::move(jit))
 {
+}
+
+JitContext::~JitContext()
+{
+    if (m_countersUsed)
+        m_counters.print();
 }
 
 static void on_close(lua_State* L);
@@ -130,6 +140,12 @@ void create(lua_State* L)
         return;
     }
 
+    if (FFlag::DebugLuauJitPerfMap && !enable_perf_map(**jit))
+        fprintf(stderr, "luaujit: perf map is only supported when linking through JITLink\n");
+
+    if (FFlag::DebugLuauJitDumpObjects && !enable_object_dump(**jit))
+        fprintf(stderr, "luaujit: could not create the object dump directory\n");
+
     auto* context = new JitContext(std::move(*jit));
 
     lua_ExecutionCallbacks* cb = &L->global->ecb;
@@ -172,6 +188,8 @@ bool get_proto_stats(lua_State* L, const int idx, ProtoStats& stats)
     {
         stats.calls = nproto->stats.calls;
         stats.tier = nproto->stats.tier;
+        stats.exits = nproto->exits;
+        stats.speculative = !(nproto->flags & NP_FLAG_NO_SPECULATION);
     }
 
     return true;
@@ -259,6 +277,12 @@ void JitContext::on_disable(lua_State* L, Proto* proto)
     );
 }
 
+void handle_exit_threshold(lua_State* L, Proto* proto)
+{
+    if (JitContext* ctx = get_jit_context(L))
+        ctx->recompile_without_speculation(proto);
+}
+
 static llvm::OptimizationLevel get_optimization_level(const ExecutionTier tier)
 {
     switch (tier)
@@ -308,11 +332,55 @@ JITCompilationResult JitContext::compile(Proto* proto)
     if (get_native_proto(proto))
         return JITCompilationResult::NothingToCompile;
 
+    JITCompilationResult result = JITCompilationResult::Success;
+    std::unique_ptr<NativeProto> nproto = compile_native(proto, /* speculate */ true, result);
+
     // Nothing is handed over to the interpreter, and nothing is remembered about the Proto, until the code is ready; a
     // failed attempt leaves the Proto exactly as it was and can be retried
+    if (!nproto)
+        return result;
+
+    bind_native_proto(proto, std::move(nproto));
+
+    return JITCompilationResult::Success;
+}
+
+void JitContext::recompile_without_speculation(Proto* proto)
+{
+    LUAU_ASSERT(proto);
+
+    auto it = m_nativeProtos.find(proto);
+    if (it == m_nativeProtos.end() || it->second->flags & (NP_FLAG_INVALIDATED | NP_FLAG_NO_SPECULATION))
+        return;
+
+    JITCompilationResult result = JITCompilationResult::Success;
+    std::unique_ptr<NativeProto> nproto = compile_native(proto, /* speculate */ false, result);
+
+    // the speculative code keeps working, it just keeps leaving
+    if (!nproto)
+        return;
+
+    nproto->stats = it->second->stats;
+
+    m_retiredProtos.push_back(std::move(it->second));
+    it->second = std::move(nproto);
+
+    // frames that are already running the old code are resumed through exectarget, which picks up the new code at
+    // the same entry pcs
+    proto->execdata = it->second.get();
+    proto->exectarget = it->second->entry;
+}
+
+std::unique_ptr<NativeProto> JitContext::compile_native(Proto* proto, const bool speculate, JITCompilationResult& result)
+{
+    LUAU_ASSERT(proto);
+
     auto owned = std::make_unique<NativeProto>();
     owned->proto = proto;
     owned->stats.tier = ExecutionTier::Baseline;
+
+    if (!speculate)
+        owned->flags |= NP_FLAG_NO_SPECULATION;
 
     NativeProto* nproto = owned.get();
 
@@ -321,9 +389,14 @@ JITCompilationResult JitContext::compile(Proto* proto)
 
     std::string name = "luau_jit_" + std::to_string(m_nextFunctionId++);
 
+    // the name is what profilers show for the function
+    name += "_";
+    name += proto->debugname ? getstr(proto->debugname) : "anon";
+    name += "_" + std::to_string(proto->linedefined);
+
     auto context = std::make_unique<llvm::LLVMContext>();
 
-    JITCompilationResult result = JITCompilationResult::Success;
+    result = JITCompilationResult::Success;
 
     // The types and the translation both hold on to the context, so they have to be gone before it is handed to ORC
     {
@@ -334,7 +407,15 @@ JITCompilationResult JitContext::compile(Proto* proto)
         VmTypes types(*context);
         types.verify_layout(module->getDataLayout());
 
-        TranslationUnit unit(*nproto, function, m_hostHooks, types, *module, name);
+        JitCounters* counters = nullptr;
+
+        if (FFlag::DebugLuauJitCounters)
+        {
+            counters = &m_counters;
+            m_countersUsed = true;
+        }
+
+        TranslationUnit unit(*nproto, function, m_hostHooks, types, *module, name, speculate, counters);
 
         if (!unit.translate())
             result = JITCompilationResult::TranslationFailed;
@@ -369,29 +450,23 @@ JITCompilationResult JitContext::compile(Proto* proto)
         }
     }
 
-    if (result == JITCompilationResult::Success)
-    {
-        auto entry = m_jit->lookup(name);
+    if (result != JITCompilationResult::Success)
+        return nullptr;
 
-        if (!entry)
-        {
-            llvm::logAllUnhandledErrors(
-                entry.takeError(), llvm::WithColor(llvm::errs(), llvm::HighlightColor::Error), "could not resolve a compiled function: "
-            );
-            result = JITCompilationResult::CodeGenFailed;
-        }
-        else
-        {
-            nproto->entry = entry->getValue();
-        }
+    auto entry = m_jit->lookup(name);
+
+    if (!entry)
+    {
+        llvm::logAllUnhandledErrors(
+            entry.takeError(), llvm::WithColor(llvm::errs(), llvm::HighlightColor::Error), "could not resolve a compiled function: "
+        );
+        result = JITCompilationResult::CodeGenFailed;
+        return nullptr;
     }
 
-    if (result != JITCompilationResult::Success)
-        return result;
+    nproto->entry = entry->getValue();
 
-    bind_native_proto(proto, std::move(owned));
-
-    return JITCompilationResult::Success;
+    return owned;
 }
 
 NativeProto* JitContext::get_native_proto(Proto* proto)

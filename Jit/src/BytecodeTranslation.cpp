@@ -1,8 +1,11 @@
 // This file is part of the Luau programming language and is licensed under MIT License; see LICENSE.txt for details
 #include "BytecodeTranslation.h"
 
+#include "BuiltinTranslation.h"
+
 #include "BytecodeAnalysis.h"
 #include "BytecodeVisitUseDef.h"
+#include "JitContext.h"
 #include "VmHelpers.h"
 
 #include "Luau/BytecodeUtils.h"
@@ -11,8 +14,10 @@
 #include "lgc.h"
 #include "lstate.h"
 #include "ltable.h"
+#include "lvm.h"
 
 #include <llvm/IR/BasicBlock.h>
+#include <llvm/IR/CFG.h>
 #include <llvm/IR/Constants.h>
 #include <llvm/IR/DataLayout.h>
 #include <llvm/IR/Function.h>
@@ -22,9 +27,12 @@
 #include <llvm/IR/Module.h>
 
 #include <algorithm>
+#include <optional>
 #include <string.h>
 
 LUAU_FASTFLAG(LuauBackedgeHeapCheck)
+LUAU_FASTINT(LuauJitExitRecompileThreshold)
+LUAU_FASTINT(LuauNativeHitsThreshold)
 
 namespace Luau::Jit
 {
@@ -39,13 +47,17 @@ TranslationUnit::TranslationUnit(
     const HostHooks& hostHooks,
     const VmTypes& types,
     llvm::Module& module,
-    const llvm::StringRef name
+    const llvm::StringRef name,
+    const bool speculate,
+    JitCounters* counters
 )
     : m_nproto(nproto)
     , m_bytecode(function)
     , m_hostHooks(hostHooks)
     , m_types(types)
     , m_module(module)
+    , m_counters(counters)
+    , m_speculate(speculate)
     , m_builder(module.getContext())
 {
     LUAU_ASSERT(nproto.proto == function.proto);
@@ -74,9 +86,12 @@ bool TranslationUnit::translate()
 
     m_blocks.clear();
     m_blocks.resize(proto->sizecode, nullptr);
+    m_genericBlocks.clear();
+    m_genericBlocks.resize(proto->sizecode, nullptr);
 
     m_entryPoints.clear();
     m_exitBlocks.clear();
+    m_slowBlocks.clear();
 
     compute_dirty_regs();
 
@@ -90,11 +105,17 @@ bool TranslationUnit::translate()
 
     // an entry pc without a case continues in the interpreter
     m_builder.SetInsertPoint(m_bailBlock);
+    if (m_counters)
+        emit_counter(&m_counters->interpreterResumes);
     m_builder.CreateRet(m_builder.getInt32(1));
 
     // the interpreter exits luau_execute when it gets 0 back
     m_builder.SetInsertPoint(m_yieldBlock);
     m_builder.CreateRet(m_builder.getInt32(0));
+
+    // only the places the interpreter resumes a frame at are entry points; any other entry pc returns to the
+    // interpreter, and every extra entry would make loop headers merge in registers of unknown type
+    mark_entry_point(0);
 
     for (uint32_t blockIdx = 0; blockIdx < static_cast<uint32_t>(m_bytecode.bcBlocks.size()); blockIdx++)
         translate_block(blockIdx);
@@ -103,10 +124,13 @@ bool TranslationUnit::translate()
     // translated early, those continue in the interpreter
     for (int pcpos = 0; pcpos < proto->sizecode; pcpos++)
     {
-        if (llvm::BasicBlock* block = m_blocks[pcpos]; block && block->empty())
+        for (llvm::BasicBlock* block : {m_blocks[pcpos], m_genericBlocks[pcpos]})
         {
-            m_builder.SetInsertPoint(block);
-            m_builder.CreateBr(vm_exit(pcpos));
+            if (block && block->empty())
+            {
+                m_builder.SetInsertPoint(block);
+                m_builder.CreateBr(vm_exit(pcpos));
+            }
         }
     }
 
@@ -175,9 +199,65 @@ llvm::Value* TranslationUnit::load_boolean(const int reg)
     return m_builder.CreateLoad(m_types.i32Ty, reg_slot(reg), "b");
 }
 
+// Vectors are accessed in the pieces that TValue copies use, the first two components in the value and the rest in
+// the extra field. An access that straddles them keeps the register out of SSA form, and then a load of the whole
+// vector right after the stores of the pieces stalls on store forwarding
+llvm::Value* TranslationUnit::load_vector(const int reg)
+{
+    llvm::Value* slot = reg_slot(reg);
+
+    llvm::Type* pairTy = llvm::FixedVectorType::get(m_types.floatTy, 2);
+    llvm::Value* xy = m_builder.CreateAlignedLoad(pairTy, slot, llvm::Align(8), "xy");
+    llvm::Value* v = m_builder.CreateShuffleVector(xy, llvm::ArrayRef<int>{0, 1, -1, -1}.take_front(LUA_VECTOR_SIZE));
+
+    for (int i = 2; i < LUA_VECTOR_SIZE; i++)
+    {
+        llvm::Value* component = m_builder.CreateConstGEP1_64(m_types.i8Ty, slot, sizeof(double) + sizeof(float) * (i - 2));
+        v = m_builder.CreateInsertElement(v, m_builder.CreateAlignedLoad(m_types.floatTy, component, llvm::Align(4)), uint64_t(i));
+    }
+
+    return v;
+}
+
 void TranslationUnit::store_tag(const int reg, const int tag)
 {
     m_builder.CreateStore(m_builder.getInt32(tag), m_builder.CreateStructGEP(m_types.tvalueTy, reg_slot(reg), VmTypes::kTValueTt));
+}
+
+// The interpreter leaves the parts of a TValue that its tag doesn't use as they were, but nothing ever reads them.
+// Zeroing them instead means the old contents don't have to be kept alive until the register is spilled
+void TranslationUnit::clear_extra(const int reg)
+{
+    m_builder.CreateStore(
+        llvm::Constant::getNullValue(m_types.tvalueTy->getElementType(VmTypes::kTValueExtra)),
+        m_builder.CreateStructGEP(m_types.tvalueTy, reg_slot(reg), VmTypes::kTValueExtra)
+    );
+}
+
+void TranslationUnit::store_nil(const int reg)
+{
+    m_builder.CreateStore(m_builder.getInt64(0), reg_slot(reg));
+    clear_extra(reg);
+    store_tag(reg, LUA_TNIL);
+}
+
+void TranslationUnit::store_object(const int reg, llvm::Value* object, const int tag)
+{
+    LUAU_ASSERT(object->getType() == m_types.ptrTy);
+
+    m_builder.CreateStore(object, reg_slot(reg));
+    clear_extra(reg);
+    store_tag(reg, tag);
+}
+
+void TranslationUnit::store_lightuserdata(const int reg, llvm::Value* pointer, const int utag)
+{
+    LUAU_ASSERT(pointer->getType() == m_types.ptrTy);
+
+    m_builder.CreateStore(pointer, reg_slot(reg));
+    clear_extra(reg);
+    store_field(m_builder.getInt32(utag), reg_slot(reg), offsetof(TValue, extra));
+    store_tag(reg, LUA_TLIGHTUSERDATA);
 }
 
 void TranslationUnit::store_number(const int reg, llvm::Value* value)
@@ -185,14 +265,34 @@ void TranslationUnit::store_number(const int reg, llvm::Value* value)
     LUAU_ASSERT(value->getType() == m_types.doubleTy);
 
     m_builder.CreateStore(value, reg_slot(reg));
+    clear_extra(reg);
     store_tag(reg, LUA_TNUMBER);
+}
+
+void TranslationUnit::store_vector(const int reg, llvm::Value* value)
+{
+    LUAU_ASSERT(value->getType() == m_types.vectorTy);
+
+    llvm::Value* slot = reg_slot(reg);
+
+    m_builder.CreateAlignedStore(m_builder.CreateShuffleVector(value, llvm::ArrayRef<int>{0, 1}), slot, llvm::Align(8));
+
+    for (int i = 2; i < LUA_VECTOR_SIZE; i++)
+    {
+        llvm::Value* component = m_builder.CreateConstGEP1_64(m_types.i8Ty, slot, sizeof(double) + sizeof(float) * (i - 2));
+        m_builder.CreateAlignedStore(m_builder.CreateExtractElement(value, uint64_t(i)), component, llvm::Align(4));
+    }
+
+    store_tag(reg, LUA_TVECTOR);
 }
 
 void TranslationUnit::store_boolean(const int reg, llvm::Value* value)
 {
     LUAU_ASSERT(value->getType() == m_types.i32Ty);
 
-    m_builder.CreateStore(value, reg_slot(reg));
+    // the boolean is the low half of the value, the rest is cleared like the extra field
+    m_builder.CreateStore(m_builder.CreateZExt(value, m_types.i64Ty), reg_slot(reg));
+    clear_extra(reg);
     store_tag(reg, LUA_TBOOLEAN);
 }
 
@@ -257,9 +357,52 @@ void TranslationUnit::store_field(llvm::Value* value, llvm::Value* object, const
     m_builder.CreateStore(value, m_types.field_ptr(m_builder, object, offset));
 }
 
+// Two scalar TBAA types under one root: accesses tagged with different ones never alias, untagged ones alias anything
+static void create_tbaa(llvm::LLVMContext& context, llvm::MDNode*& header, llvm::MDNode*& buffer)
+{
+    if (header)
+        return;
+
+    llvm::MDBuilder md(context);
+    llvm::MDNode* root = md.createTBAARoot("luau jit");
+    llvm::MDNode* headerType = md.createTBAAScalarTypeNode("vm header", root);
+    llvm::MDNode* bufferType = md.createTBAAScalarTypeNode("buffer data", root);
+
+    header = md.createTBAAStructTagNode(headerType, headerType, 0);
+    buffer = md.createTBAAStructTagNode(bufferType, bufferType, 0);
+}
+
+llvm::Value* TranslationUnit::load_header(llvm::Type* type, llvm::Value* object, const size_t offset, const llvm::Twine& name)
+{
+    create_tbaa(m_module.getContext(), m_tbaaHeader, m_tbaaBuffer);
+
+    llvm::LoadInst* load = m_builder.CreateLoad(type, m_types.field_ptr(m_builder, object, offset), name);
+    load->setMetadata(llvm::LLVMContext::MD_tbaa, m_tbaaHeader);
+    return load;
+}
+
+void TranslationUnit::mark_buffer_access(llvm::Instruction* access)
+{
+    create_tbaa(m_module.getContext(), m_tbaaHeader, m_tbaaBuffer);
+
+    access->setMetadata(llvm::LLVMContext::MD_tbaa, m_tbaaBuffer);
+}
+
+llvm::Value* TranslationUnit::is_safe_env()
+{
+    // the environment can stop being safe through getfenv/setfenv after the code was generated
+    llvm::Value* env = load_header(m_types.ptrTy, m_closure, offsetof(Closure, env), "env");
+    llvm::Value* safeenv = load_header(m_types.i8Ty, env, offsetof(LuaTable, safeenv), "safeenv");
+
+    return m_builder.CreateICmpNE(safeenv, m_builder.getInt8(0));
+}
+
 llvm::Value* TranslationUnit::call_helper(const void* helper, const int pcpos, const bool returnsInt)
 {
     llvm::Type* result = returnsInt ? static_cast<llvm::Type*>(m_types.i32Ty) : m_types.voidTy;
+
+    if (m_counters)
+        emit_counter(&m_counters->helperCalls[LUAU_INSN_OP(m_bytecode.proto->code[pcpos])]);
 
     return call_native(helper, result, {m_state, insn_ptr(pcpos)});
 }
@@ -290,13 +433,9 @@ void TranslationUnit::spill(const int pcpos)
     }
 }
 
-void TranslationUnit::reload()
+static bool is_fastcall(const LuauOpcode op)
 {
-    llvm::Value* base = m_types.load_state_base(m_builder, m_state);
-    m_builder.CreateStore(base, m_baseSlot);
-
-    for (int reg = 0; reg < m_bytecode.proto->maxstacksize; reg++)
-        m_types.copy_tvalue(m_builder, reg_slot(reg), m_types.stack_slot(m_builder, base, reg));
+    return op == LOP_FASTCALL || op == LOP_FASTCALL1 || op == LOP_FASTCALL2 || op == LOP_FASTCALL2K || op == LOP_FASTCALL3;
 }
 
 // Instructions that call into the VM on every path, which leaves all registers in sync with the stack afterwards
@@ -305,10 +444,8 @@ static bool always_syncs(const LuauOpcode op)
     switch (op)
     {
     case LOP_SETGLOBAL:
-    case LOP_SETUPVAL:
     case LOP_CLOSEUPVALS:
     case LOP_NEWCLOSURE:
-    case LOP_NAMECALL:
     case LOP_CALL:
     case LOP_CALLFB:
     case LOP_CONCAT:
@@ -316,9 +453,6 @@ static bool always_syncs(const LuauOpcode op)
     case LOP_DUPTABLE:
     case LOP_SETLIST:
     case LOP_FORGPREP:
-    case LOP_FORGPREP_NEXT:
-    case LOP_FORGPREP_INEXT:
-    case LOP_FORGLOOP:
     case LOP_GETVARARGS:
     case LOP_PREPVARARGS:
     case LOP_DUPCLOSURE:
@@ -379,6 +513,10 @@ void TranslationUnit::compute_dirty_regs()
 
     m_dirtyIn.assign(proto->sizecode, {});
 
+    m_liveIn = compute_pc_liveness(m_bytecode).in;
+    const std::vector<std::bitset<256>>& liveIn = m_liveIn;
+    const std::bitset<256> captured = cfg.captured.regs;
+
     std::vector<std::bitset<256>> blockIn(blockCount);
     std::vector<std::bitset<256>> blockOut(blockCount);
 
@@ -386,12 +524,47 @@ void TranslationUnit::compute_dirty_regs()
     {
         const auto& [startpc, finishpc] = m_bytecode.bcBlocks[blockIdx];
 
+        // An inline builtin skips over its paired CALL without syncing anything but the result. The skip isn't a CFG
+        // edge, so the set it carries is merged in at the target, or at the end of the block when the target starts the
+        // next one
+        std::vector<std::pair<int, std::bitset<256>>> skips;
+
         for (int pcpos = startpc; pcpos <= finishpc;)
         {
+            for (auto it = skips.begin(); it != skips.end();)
+            {
+                if (it->first == pcpos)
+                {
+                    dirty |= it->second;
+                    it = skips.erase(it);
+                }
+                else
+                {
+                    ++it;
+                }
+            }
+
+            // nothing reads a dead register again, but within a block its value still reaches the stack before every
+            // call, which is what makes 'x = nil; collectgarbage()' release the old value. Like CodeGen, the value is
+            // only dropped at the end of the block, and captured registers never are, since closures read them
+            if (pcpos == startpc)
+                dirty &= liveIn[pcpos] | captured;
+
             if (record)
                 m_dirtyIn[pcpos] = dirty;
 
-            const auto op = static_cast<LuauOpcode>(LUAU_INSN_OP(proto->code[pcpos]));
+            const Instruction* pc = &proto->code[pcpos];
+            const auto op = static_cast<LuauOpcode>(LUAU_INSN_OP(*pc));
+
+            int count = 0;
+
+            if (const int result = is_fastcall(op) ? inline_builtin_results(proto, pcpos, count) : -1; result >= 0)
+            {
+                skips.emplace_back(getJumpTarget(*pc, pcpos), dirty);
+
+                for (int reg = result; reg < result + count; reg++)
+                    skips.back().second.set(reg);
+            }
 
             if (always_syncs(op))
             {
@@ -405,6 +578,9 @@ void TranslationUnit::compute_dirty_regs()
 
             pcpos += getOpLength(op);
         }
+
+        for (const auto& [target, skipped] : skips)
+            dirty |= skipped;
 
         return dirty;
     };
@@ -437,9 +613,47 @@ void TranslationUnit::compute_dirty_regs()
         transfer(blockIdx, blockIn[blockIdx], true);
 }
 
+// Helpers only write the registers that their instruction defines and the ones closures have captured, except for the
+// instructions that place a frame inside of this one, which leave nothing as it was
+void TranslationUnit::reload(const int pcpos)
+{
+    Proto* proto = m_bytecode.proto;
+    const auto op = static_cast<LuauOpcode>(LUAU_INSN_OP(proto->code[pcpos]));
+
+    std::bitset<256> regs = m_bytecode.cfg.captured.regs;
+
+    if (always_syncs(op))
+    {
+        regs.set();
+    }
+    else
+    {
+        DirtyVisitor visitor{regs, proto->maxstacksize};
+        visit_bytecode_reg_defs_uses(visitor, proto, pcpos);
+    }
+
+    reload_regs(regs);
+}
+
+void TranslationUnit::reload_regs(const std::bitset<256>& regs)
+{
+    m_slowBlocks.insert(current_block());
+
+    // the stack might have been reallocated even when no register changed
+    llvm::Value* base = m_types.load_state_base(m_builder, m_state);
+    m_builder.CreateStore(base, m_baseSlot);
+
+    for (int reg = 0; reg < m_bytecode.proto->maxstacksize; reg++)
+    {
+        if (regs.test(reg))
+            m_types.copy_tvalue(m_builder, reg_slot(reg), m_types.stack_slot(m_builder, base, reg));
+    }
+}
+
 void TranslationUnit::emit_safepoint(const int pcpos, const bool backedge)
 {
-    llvm::Value* global = load_field(m_types.ptrTy, m_state, offsetof(lua_State, global), "global");
+    auto* global = llvm::cast<llvm::LoadInst>(load_field(m_types.ptrTy, m_state, offsetof(lua_State, global), "global"));
+    global->setMetadata(llvm::LLVMContext::MD_invariant_load, llvm::MDNode::get(m_module.getContext(), {}));
 
     // the hook can be installed from outside of the VM at any point, so the read must not be hoisted out of loops
     llvm::LoadInst* interrupt = m_builder.CreateLoad(
@@ -462,7 +676,7 @@ void TranslationUnit::emit_safepoint(const int pcpos, const bool backedge)
     llvm::BasicBlock* slow = new_block("safepoint");
     llvm::BasicBlock* resume = new_block("safepoint.done");
 
-    m_builder.CreateCondBr(cond, slow, resume, llvm::MDBuilder(m_module.getContext()).createUnlikelyBranchWeights());
+    m_builder.CreateCondBr(cond, slow, resume, unlikely());
 
     m_builder.SetInsertPoint(slow);
     spill(pcpos);
@@ -474,13 +688,23 @@ void TranslationUnit::emit_safepoint(const int pcpos, const bool backedge)
     m_builder.CreateCondBr(m_builder.CreateICmpNE(stop, m_builder.getInt32(0)), yield_exit(), reloadBlock);
 
     m_builder.SetInsertPoint(reloadBlock);
-    reload();
+    reload_regs(m_bytecode.cfg.captured.regs);
     m_builder.CreateBr(resume);
 
     m_builder.SetInsertPoint(resume);
 
     // after a yield or a break, the thread resumes by running this instruction again
     mark_entry_point(pcpos);
+}
+
+void TranslationUnit::emit_enter_native(llvm::Value* target)
+{
+    if (m_counters)
+        emit_counter(&m_counters->nativeTransfers);
+
+    llvm::CallInst* call = m_builder.CreateCall(m_types.nativeEntryTy, target, {m_state, m_builder.getInt32(0)});
+    call->setTailCallKind(llvm::CallInst::TCK_MustTail);
+    m_builder.CreateRet(call);
 }
 
 void TranslationUnit::emit_resume_ci()
@@ -506,6 +730,9 @@ void TranslationUnit::emit_resume_ci()
     llvm::Value* code = load_field(m_types.ptrTy, proto, offsetof(Proto, code), "code");
     llvm::Value* entrypc = m_builder.CreateTrunc(m_builder.CreatePtrDiff(m_types.i32Ty, savedpc, code), m_types.i32Ty, "entrypc");
 
+    if (m_counters)
+        emit_counter(&m_counters->nativeTransfers);
+
     // the tail call keeps the C stack flat no matter how deep the Lua call stack gets
     llvm::CallInst* call = m_builder.CreateCall(m_types.nativeEntryTy, target, {m_state, entrypc});
     call->setTailCallKind(llvm::CallInst::TCK_MustTail);
@@ -515,31 +742,52 @@ void TranslationUnit::emit_resume_ci()
 void TranslationUnit::emit_table_barrier(llvm::Value* table, const int valueReg)
 {
     // luaC_barriert
-    llvm::BasicBlock* checkTable = new_block("barrier.table");
+    emit_barrier(table, valueReg, reinterpret_cast<const void*>(&luaC_barriertable));
+}
+
+void TranslationUnit::emit_barrier(llvm::Value* object, const int valueReg, const void* barrier)
+{
+    llvm::BasicBlock* checkObject = new_block("barrier.object");
     llvm::BasicBlock* checkValue = new_block("barrier.value");
     llvm::BasicBlock* slow = new_block("barrier");
     llvm::BasicBlock* done = new_block("barrier.done");
 
     llvm::Value* collectable = m_builder.CreateICmpSGE(load_tag(valueReg), m_builder.getInt32(LUA_TSTRING));
-    m_builder.CreateCondBr(collectable, checkTable, done);
+    m_builder.CreateCondBr(collectable, checkObject, done);
 
-    m_builder.SetInsertPoint(checkTable);
-    llvm::Value* tableMarked = load_field(m_types.i8Ty, table, offsetof(GCheader, marked));
-    llvm::Value* isBlack = m_builder.CreateICmpNE(m_builder.CreateAnd(tableMarked, bitmask(BLACKBIT)), m_builder.getInt8(0));
+    m_builder.SetInsertPoint(checkObject);
+    llvm::Value* objectMarked = load_field(m_types.i8Ty, object, offsetof(GCheader, marked));
+    llvm::Value* isBlack = m_builder.CreateICmpNE(m_builder.CreateAnd(objectMarked, bitmask(BLACKBIT)), m_builder.getInt8(0));
     m_builder.CreateCondBr(isBlack, checkValue, done);
 
     m_builder.SetInsertPoint(checkValue);
-    llvm::Value* object = load_pointer(valueReg);
-    llvm::Value* valueMarked = load_field(m_types.i8Ty, object, offsetof(GCheader, marked));
+    llvm::Value* value = load_pointer(valueReg);
+    llvm::Value* valueMarked = load_field(m_types.i8Ty, value, offsetof(GCheader, marked));
     llvm::Value* isWhite = m_builder.CreateICmpNE(m_builder.CreateAnd(valueMarked, WHITEBITS), m_builder.getInt8(0));
-    m_builder.CreateCondBr(isWhite, slow, done, llvm::MDBuilder(m_module.getContext()).createUnlikelyBranchWeights());
+    m_builder.CreateCondBr(isWhite, slow, done, unlikely());
 
     // the barrier never collects garbage or reads the stack, so nothing has to be spilled for it
     m_builder.SetInsertPoint(slow);
-    call_native(reinterpret_cast<const void*>(&luaC_barriertable), m_types.voidTy, {m_state, table, object});
+    call_native(barrier, m_types.voidTy, {m_state, object, value});
     m_builder.CreateBr(done);
 
     m_builder.SetInsertPoint(done);
+}
+
+llvm::MDNode* TranslationUnit::likely()
+{
+    if (!m_likely)
+        m_likely = llvm::MDBuilder(m_module.getContext()).createLikelyBranchWeights();
+
+    return m_likely;
+}
+
+llvm::MDNode* TranslationUnit::unlikely()
+{
+    if (!m_unlikely)
+        m_unlikely = llvm::MDBuilder(m_module.getContext()).createUnlikelyBranchWeights();
+
+    return m_unlikely;
 }
 
 llvm::BasicBlock* TranslationUnit::new_block(const llvm::Twine& name)
@@ -551,23 +799,46 @@ llvm::BasicBlock* TranslationUnit::block_at(const int pcpos)
 {
     LUAU_ASSERT(pcpos >= 0 && static_cast<size_t>(pcpos) < m_blocks.size());
 
+    if (pcpos > m_blockStart && pcpos <= m_blockFinish && (m_generic || in_slow_path()))
+        return generic_block_at(pcpos);
+
+    return fast_block_at(pcpos);
+}
+
+llvm::BasicBlock* TranslationUnit::fast_block_at(const int pcpos)
+{
     if (!m_blocks[pcpos])
         m_blocks[pcpos] = llvm::BasicBlock::Create(m_module.getContext(), "bc_" + llvm::Twine(pcpos), m_function);
 
     return m_blocks[pcpos];
 }
 
-void TranslationUnit::mark_entry_point(int pcpos)
+llvm::BasicBlock* TranslationUnit::generic_block_at(const int pcpos)
 {
-    llvm::BasicBlock* block = block_at(pcpos);
+    if (!m_genericBlocks[pcpos])
+        m_genericBlocks[pcpos] = llvm::BasicBlock::Create(m_module.getContext(), "bc_" + llvm::Twine(pcpos) + ".generic", m_function);
 
-    for (const auto& [fst, snd] : m_entryPoints)
+    return m_genericBlocks[pcpos];
+}
+
+bool TranslationUnit::in_slow_path() const
+{
+    // the blocks after a helper call are usually a short chain, like the one past a check for a yield
+    llvm::BasicBlock* block = current_block();
+
+    for (int depth = 0; block && depth < 4; depth++, block = block->getSinglePredecessor())
     {
-        if (fst == pcpos)
-            return;
+        if (m_slowBlocks.contains(block))
+            return true;
     }
 
-    m_entryPoints.push_back({pcpos, block});
+    return false;
+}
+
+void TranslationUnit::mark_entry_point(int pcpos)
+{
+    if (std::find(m_entryPoints.begin(), m_entryPoints.end(), pcpos) == m_entryPoints.end())
+        m_entryPoints.push_back(pcpos);
 }
 
 llvm::BasicBlock* TranslationUnit::vm_exit(const int pcpos)
@@ -610,9 +881,6 @@ void TranslationUnit::emit_prologue()
     llvm::Value* ci = m_types.load_state_ci(m_builder, m_state);
     llvm::Value* func = load_field(m_types.ptrTy, ci, offsetof(CallInfo, func), "func");
     m_closure = load_field(m_types.ptrTy, func, offsetof(TValue, value), "cl");
-
-    for (int i = 0; i < proto->maxstacksize; i++)
-        m_types.copy_tvalue(m_builder, m_regSlots[i], m_types.stack_slot(m_builder, base, i));
 }
 
 void TranslationUnit::emit_dispatch()
@@ -624,10 +892,35 @@ void TranslationUnit::emit_dispatch()
 
     llvm::SwitchInst* dispatch = m_builder.CreateSwitch(m_entrypc, m_bailBlock, static_cast<unsigned>(m_entryPoints.size()));
 
-    for (const auto& [fst, snd] : m_entryPoints)
-        dispatch->addCase(m_builder.getInt32(fst), snd);
+    // entering in the middle of a bytecode block goes to its generic copy, which keeps the fast copy a straight line
+    for (const int pcpos : m_entryPoints)
+    {
+        llvm::BasicBlock* block = m_genericBlocks[pcpos] ? m_genericBlocks[pcpos] : m_blocks[pcpos];
+        LUAU_ASSERT(block);
+
+        llvm::BasicBlock* enter = new_block("enter." + llvm::Twine(pcpos));
+        dispatch->addCase(m_builder.getInt32(pcpos), enter);
+
+        // the other registers are dead, and they are written before anything can spill them: a register only stays
+        // dirty across a block start while it's live, and a live one that isn't loaded here is written on the way
+        m_builder.SetInsertPoint(enter);
+        llvm::Value* base = load_base();
+        const std::bitset<256> regs = m_liveIn[pcpos] | m_bytecode.cfg.captured.regs | m_dirtyIn[pcpos];
+
+        for (int reg = 0; reg < m_bytecode.proto->maxstacksize; reg++)
+        {
+            if (regs.test(reg))
+                m_types.copy_tvalue(m_builder, m_regSlots[reg], m_types.stack_slot(m_builder, base, reg));
+        }
+
+        m_builder.CreateBr(block);
+        m_builder.SetInsertPoint(m_entryBlock);
+    }
 }
 
+// A slow path continues in a generic copy of the rest of its bytecode block instead of merging back into the code it
+// left. The fast copy then has a single way into each instruction, so everything known about the registers stays
+// known until the end of the block, like the linear blocks of CodeGen
 void TranslationUnit::translate_block(const uint32_t blockIdx)
 {
     const Proto* proto = m_bytecode.proto;
@@ -635,22 +928,58 @@ void TranslationUnit::translate_block(const uint32_t blockIdx)
     const auto& [startpc, finishpc] = m_bytecode.bcBlocks[blockIdx];
     LUAU_ASSERT(startpc >= 0 && finishpc >= startpc && finishpc < proto->sizecode);
 
-    mark_entry_point(startpc);
+    m_blockStart = startpc;
+    m_blockFinish = finishpc;
 
+    translate_range(startpc, finishpc, /* generic */ false);
+
+    for (const int pcpos : m_entryPoints)
+    {
+        if (pcpos > startpc && pcpos <= finishpc)
+            generic_block_at(pcpos);
+    }
+
+    for (int pcpos = startpc + 1; pcpos <= finishpc; pcpos++)
+    {
+        if (m_genericBlocks[pcpos])
+        {
+            translate_range(pcpos, finishpc, /* generic */ true);
+            break;
+        }
+    }
+
+    m_blockStart = -1;
+    m_blockFinish = -1;
+}
+
+void TranslationUnit::translate_range(const int startpc, const int finishpc, const bool generic)
+{
+    const Proto* proto = m_bytecode.proto;
+
+    m_generic = generic;
     m_builder.ClearInsertionPoint();
 
     int pcpos = startpc;
     while (pcpos <= finishpc)
     {
-        llvm::BasicBlock* target = block_at(pcpos);
-
+        // falling through out of a slow path goes on in the generic copy
         if (llvm::BasicBlock* previous = current_block(); previous && !previous->hasTerminator())
-            m_builder.CreateBr(target);
-
-        m_builder.SetInsertPoint(target);
+            m_builder.CreateBr(block_at(pcpos));
 
         const Instruction* pc = &proto->code[pcpos];
         const auto op = static_cast<LuauOpcode>(LUAU_INSN_OP(*pc));
+
+        // only the instructions before can branch into the fast copy, so an instruction that none of them reach there
+        // can be left out; a later one can still be the target of a fastcall that skips its CALL
+        if (!generic && pcpos != startpc && (!m_blocks[pcpos] || llvm::pred_empty(m_blocks[pcpos])))
+        {
+            m_builder.ClearInsertionPoint();
+            pcpos += getOpLength(op);
+            continue;
+        }
+
+        llvm::BasicBlock* target = generic ? generic_block_at(pcpos) : fast_block_at(pcpos);
+        m_builder.SetInsertPoint(target);
 
         if (!translate_inst(op, pc, pcpos))
         {
@@ -667,6 +996,8 @@ void TranslationUnit::translate_block(const uint32_t blockIdx)
 
         m_builder.CreateBr(block_at(pcpos));
     }
+
+    m_generic = false;
 }
 
 bool TranslationUnit::translate_inst(const LuauOpcode op, const Instruction* pc, const int pcpos)
@@ -709,7 +1040,7 @@ bool TranslationUnit::translate_inst(const LuauOpcode op, const Instruction* pc,
         lower_inst_getupval(*this, pc, pcpos);
         return true;
     case LOP_SETUPVAL:
-        lower_inst_helper(*this, reinterpret_cast<const void*>(&execute_setupval), pcpos);
+        lower_inst_setupval(*this, pc, pcpos);
         return true;
     case LOP_CLOSEUPVALS:
         lower_inst_helper(*this, reinterpret_cast<const void*>(&execute_closeupvals), pcpos);
@@ -739,7 +1070,7 @@ bool TranslationUnit::translate_inst(const LuauOpcode op, const Instruction* pc,
         lower_inst_helper(*this, reinterpret_cast<const void*>(&execute_newclosure), pcpos);
         return true;
     case LOP_NAMECALL:
-        lower_inst_helper(*this, reinterpret_cast<const void*>(&execute_namecall), pcpos);
+        lower_inst_namecall(*this, pc, pcpos);
         return true;
     case LOP_CALL:
     case LOP_CALLFB:
@@ -902,11 +1233,40 @@ void TranslationUnit::emit_vm_exit(const int pcpos, llvm::BasicBlock* block)
         m_types.copy_tvalue(m_builder, m_types.stack_slot(m_builder, base, value.reg), reg_slot(value.reg));
     }
 
+    if (m_counters)
+        emit_counter(&m_counters->vmExits[LUAU_INSN_OP(proto->code[pcpos])]);
+
+    if (m_speculate)
+    {
+        // a function that keeps failing its guards gets recompiled without them
+        llvm::Value* address = const_ptr(&m_nproto.exits);
+        llvm::Value* exits = m_builder.CreateAdd(m_builder.CreateLoad(m_types.i32Ty, address), m_builder.getInt32(1));
+        m_builder.CreateStore(exits, address);
+
+        llvm::BasicBlock* recompile = new_block("exit.recompile");
+        llvm::BasicBlock* leave = new_block("exit.leave");
+
+        m_builder.CreateCondBr(m_builder.CreateICmpEQ(exits, m_builder.getInt32(FInt::LuauJitExitRecompileThreshold)), recompile, leave, unlikely());
+
+        m_builder.SetInsertPoint(recompile);
+        call_native(reinterpret_cast<const void*>(&handle_exit_threshold), m_types.voidTy, {m_state, const_ptr(proto)});
+        m_builder.CreateBr(leave);
+
+        m_builder.SetInsertPoint(leave);
+    }
+
     llvm::Value* ci = m_types.load_state_ci(m_builder, m_state);
     m_types.store_ci_savedpc(m_builder, ci, const_ptr(&proto->code[pcpos]));
     m_builder.CreateRet(m_builder.getInt32(1));
 
     m_nproto.deopts.push_back(std::move(deopt));
+}
+
+void TranslationUnit::emit_counter(uint64_t* counter)
+{
+    llvm::Value* address = const_ptr(counter);
+    llvm::Value* value = m_builder.CreateLoad(m_types.i64Ty, address);
+    m_builder.CreateStore(m_builder.CreateAdd(value, m_builder.getInt64(1)), address);
 }
 
 DeoptPoint TranslationUnit::build_deopt_point(const int pcpos) const
@@ -954,7 +1314,7 @@ static void lower_with_fallback(TranslationUnit& unit, llvm::Value* fast, const 
     llvm::BasicBlock* slowBlock = unit.new_block("slow");
     llvm::BasicBlock* next = unit.block_at(nextpc);
 
-    build.CreateCondBr(fast, fastBlock, slowBlock);
+    build.CreateCondBr(fast, fastBlock, slowBlock, unit.likely());
 
     build.SetInsertPoint(fastBlock);
     lowerFast();
@@ -964,13 +1324,60 @@ static void lower_with_fallback(TranslationUnit& unit, llvm::Value* fast, const 
     build.SetInsertPoint(slowBlock);
     unit.spill(pcpos);
     unit.call_helper(helper, pcpos, false);
-    unit.reload();
+    unit.reload(pcpos);
     build.CreateBr(next);
+}
+
+static bool speculates_on_tag(const TranslationUnit& unit, const uint8_t type, const int tag)
+{
+    return (tag == LUA_TNUMBER && unit.speculates_on(type, LBC_TYPE_NUMBER)) || (tag == LUA_TVECTOR && unit.speculates_on(type, LBC_TYPE_VECTOR));
+}
+
+// An operand that the bytecode types say has its tag leaves generated code when it doesn't, which keeps the slow path
+// from merging back into the code that follows
+void check_operand_tags(
+    TranslationUnit& unit,
+    const int pcpos,
+    const llvm::ArrayRef<TypedOperand> operands,
+    llvm::BasicBlock* fast,
+    llvm::BasicBlock* slow
+)
+{
+    llvm::IRBuilder<>& build = unit.builder();
+
+    std::vector<TypedOperand> checks;
+    for (const TypedOperand& operand : operands)
+    {
+        if (operand.reg < 0)
+            continue;
+
+        bool duplicate = false;
+        for (const TypedOperand& check : checks)
+            duplicate |= check.reg == operand.reg;
+
+        if (!duplicate)
+            checks.push_back(operand);
+    }
+
+    if (checks.empty())
+    {
+        build.CreateBr(fast);
+        return;
+    }
+
+    for (size_t i = 0; i < checks.size(); i++)
+    {
+        llvm::BasicBlock* next = i + 1 == checks.size() ? fast : unit.new_block("tag.check");
+        llvm::BasicBlock* failure = speculates_on_tag(unit, checks[i].type, checks[i].tag) ? unit.vm_exit(pcpos) : slow;
+
+        build.CreateCondBr(tag_is(unit, checks[i].reg, checks[i].tag), next, failure, unit.likely());
+        build.SetInsertPoint(next);
+    }
 }
 
 void lower_inst_loadnil(TranslationUnit& unit, const Instruction* pc, int pcpos)
 {
-    unit.store_tag(LUAU_INSN_A(*pc), LUA_TNIL);
+    unit.store_nil(LUAU_INSN_A(*pc));
 }
 
 void lower_inst_loadb(TranslationUnit& unit, const Instruction* pc, int pcpos)
@@ -1000,6 +1407,23 @@ void lower_inst_move(TranslationUnit& unit, const Instruction* pc, int pcpos)
     unit.store_reg(LUAU_INSN_A(*pc), unit.load_reg(LUAU_INSN_B(*pc)));
 }
 
+// whether the node has the string 'key' with a value that isn't nil
+static llvm::Value* node_holds(TranslationUnit& unit, llvm::Value* node, const TString* key)
+{
+    llvm::IRBuilder<>& build = unit.builder();
+    const VmTypes& types = unit.types();
+
+    llvm::Value* keyTag = build.CreateAnd(unit.load_field(types.i32Ty, node, kNodeKeyTagOffset), 0xf);
+    llvm::Value* keyValue = unit.load_field(types.ptrTy, node, offsetof(LuaNode, key) + offsetof(TKey, value));
+    llvm::Value* valueTag = unit.load_field(types.i32Ty, node, offsetof(LuaNode, val) + offsetof(TValue, tt));
+
+    return build.CreateAnd(
+        build.CreateAnd(build.CreateICmpEQ(keyTag, build.getInt32(LUA_TSTRING)), build.CreateICmpEQ(keyValue, unit.const_ptr(key))),
+        build.CreateICmpNE(valueTag, build.getInt32(LUA_TNIL)),
+        "hit"
+    );
+}
+
 // Looks up 'key' in the node that the cached slot in the instruction's C points to, like the interpreter's predictive
 // lookups; returns the condition for a hit and the address of the node's value
 static std::pair<llvm::Value*, llvm::Value*> lookup_cached_slot(TranslationUnit& unit, llvm::Value* table, const int pcpos, const TString* key)
@@ -1017,17 +1441,7 @@ static std::pair<llvm::Value*, llvm::Value*> lookup_cached_slot(TranslationUnit&
     llvm::Value* nodes = unit.load_field(types.ptrTy, table, offsetof(LuaTable, node), "node");
     llvm::Value* node = build.CreateInBoundsGEP(types.i8Ty, nodes, build.CreateMul(slot, build.getInt64(sizeof(LuaNode))), "n");
 
-    llvm::Value* keyTag = build.CreateAnd(unit.load_field(types.i32Ty, node, kNodeKeyTagOffset), 0xf);
-    llvm::Value* keyValue = unit.load_field(types.ptrTy, node, offsetof(LuaNode, key) + offsetof(TKey, value));
-    llvm::Value* valueTag = unit.load_field(types.i32Ty, node, offsetof(LuaNode, val) + offsetof(TValue, tt));
-
-    llvm::Value* hit = build.CreateAnd(
-        build.CreateAnd(build.CreateICmpEQ(keyTag, build.getInt32(LUA_TSTRING)), build.CreateICmpEQ(keyValue, unit.const_ptr(key))),
-        build.CreateICmpNE(valueTag, build.getInt32(LUA_TNIL)),
-        "hit"
-    );
-
-    return {hit, types.field_ptr(build, node, offsetof(LuaNode, val))};
+    return {node_holds(unit, node, key), types.field_ptr(build, node, offsetof(LuaNode, val))};
 }
 
 static const TString* string_constant(TranslationUnit& unit, const int kidx)
@@ -1093,6 +1507,26 @@ void lower_inst_getupval(TranslationUnit& unit, const Instruction* pc, int pcpos
     unit.store_reg(ra, build.CreateLoad(types.tvalueTy, source));
 }
 
+void lower_inst_setupval(TranslationUnit& unit, const Instruction* pc, int pcpos)
+{
+    llvm::IRBuilder<>& build = unit.builder();
+    const VmTypes& types = unit.types();
+
+    const int ra = LUAU_INSN_A(*pc);
+    const int up = LUAU_INSN_B(*pc);
+
+    // the compiler only emits SETUPVAL for upvalues captured by reference, and those always hold an UpVal; an open one
+    // points into the frame of an enclosing function, which never is this one
+    llvm::Value* ur = types.field_ptr(build, unit.closure(), offsetof(Closure, l.uprefs) + sizeof(TValue) * up, "ur");
+    llvm::Value* upval = unit.load_field(types.ptrTy, ur, offsetof(TValue, value), "uv");
+    llvm::Value* v = unit.load_field(types.ptrTy, upval, offsetof(UpVal, v), "v");
+
+    types.copy_tvalue(build, v, unit.reg_slot(ra));
+
+    // luaC_barrier
+    unit.emit_barrier(upval, ra, reinterpret_cast<const void*>(&luaC_barrierf));
+}
+
 void lower_inst_getimport(TranslationUnit& unit, const Instruction* pc, int pcpos)
 {
     llvm::IRBuilder<>& build = unit.builder();
@@ -1110,13 +1544,9 @@ void lower_inst_getimport(TranslationUnit& unit, const Instruction* pc, int pcpo
         return;
     }
 
-    // the environment can stop being safe through getfenv/setfenv after the code was generated
-    llvm::Value* env = unit.load_field(types.ptrTy, unit.closure(), offsetof(Closure, env), "env");
-    llvm::Value* safeenv = unit.load_field(types.i8Ty, env, offsetof(LuaTable, safeenv), "safeenv");
-
     lower_with_fallback(
         unit,
-        build.CreateICmpNE(safeenv, build.getInt8(0)),
+        unit.is_safe_env(),
         helper,
         pcpos,
         next_pc(pc, pcpos),
@@ -1125,6 +1555,21 @@ void lower_inst_getimport(TranslationUnit& unit, const Instruction* pc, int pcpo
             unit.store_reg(ra, unit.constant(kidx));
         }
     );
+}
+
+// The component that lvmexecute.cpp reads inline for a vector index, or -1
+static int vector_component(const TValue& key)
+{
+    const TString* name = tsvalue(&key);
+    int ic = (getstr(name)[0] | ' ') - 'x';
+
+#if LUA_VECTOR_SIZE == 4
+    // 'w' is before 'x' in ascii
+    if (ic == -1)
+        ic = 3;
+#endif
+
+    return name->len == 1 && unsigned(ic) < LUA_VECTOR_SIZE ? ic : -1;
 }
 
 void lower_inst_gettableks(TranslationUnit& unit, const Instruction* pc, int pcpos)
@@ -1138,16 +1583,38 @@ void lower_inst_gettableks(TranslationUnit& unit, const Instruction* pc, int pcp
 
     const void* helper = reinterpret_cast<const void*>(&execute_gettableks);
 
+    const BytecodeTypes& bcTypes = unit.bytecode().bcTypes[pcpos];
+
+    if (const int component = bcTypes.a == LBC_TYPE_VECTOR ? vector_component(unit.bytecode().proto->k[pc[1]]) : -1; component >= 0)
+    {
+        llvm::BasicBlock* fast = unit.new_block("vector");
+        llvm::BasicBlock* slow = unit.new_block("slow");
+
+        check_operand_tags(unit, pcpos, {{rb, bcTypes.a, LUA_TVECTOR}}, fast, slow);
+
+        build.SetInsertPoint(fast);
+        llvm::Value* value = build.CreateExtractElement(unit.load_vector(rb), uint64_t(component));
+        unit.store_number(ra, build.CreateFPExt(value, types.doubleTy));
+        build.CreateBr(unit.block_at(nextpc));
+
+        build.SetInsertPoint(slow);
+        unit.spill(pcpos);
+        unit.call_helper(helper, pcpos, false);
+        unit.reload(pcpos);
+        build.CreateBr(unit.block_at(nextpc));
+        return;
+    }
+
     llvm::BasicBlock* isTable = unit.new_block("table");
     llvm::BasicBlock* slow = unit.new_block("slow");
 
-    build.CreateCondBr(tag_is(unit, rb, LUA_TTABLE), isTable, slow);
+    build.CreateCondBr(tag_is(unit, rb, LUA_TTABLE), isTable, slow, unit.likely());
 
     build.SetInsertPoint(isTable);
     auto [hit, value] = lookup_cached_slot(unit, unit.load_pointer(rb), pcpos, string_constant(unit, static_cast<int>(pc[1])));
 
     llvm::BasicBlock* fast = unit.new_block("fast");
-    build.CreateCondBr(hit, fast, slow);
+    build.CreateCondBr(hit, fast, slow, unit.likely());
 
     build.SetInsertPoint(fast);
     unit.store_reg(ra, build.CreateLoad(types.tvalueTy, value));
@@ -1156,7 +1623,75 @@ void lower_inst_gettableks(TranslationUnit& unit, const Instruction* pc, int pcp
     build.SetInsertPoint(slow);
     unit.spill(pcpos);
     unit.call_helper(helper, pcpos, false);
-    unit.reload();
+    unit.reload(pcpos);
+    build.CreateBr(unit.block_at(nextpc));
+}
+
+// The table part of LOP_NAMECALL: the method is in the main position of its key in the table, or the key is absent
+// and the method is in the cached slot of the __index table of the metatable
+void lower_inst_namecall(TranslationUnit& unit, const Instruction* pc, int pcpos)
+{
+    llvm::IRBuilder<>& build = unit.builder();
+    const VmTypes& types = unit.types();
+
+    const int ra = LUAU_INSN_A(*pc);
+    const int rb = LUAU_INSN_B(*pc);
+    const int nextpc = next_pc(pc, pcpos);
+    const TString* key = string_constant(unit, static_cast<int>(pc[1]));
+
+    llvm::BasicBlock* isTable = unit.new_block("namecall.table");
+    llvm::BasicBlock* inIndex = unit.new_block("namecall.index");
+    llvm::BasicBlock* hasIndex = unit.new_block("namecall.hasindex");
+    llvm::BasicBlock* indexTable = unit.new_block("namecall.indextable");
+    llvm::BasicBlock* found = unit.new_block("namecall.found");
+    llvm::BasicBlock* slow = unit.new_block("namecall.slow");
+
+    build.CreateCondBr(tag_is(unit, rb, LUA_TTABLE), isTable, slow, unit.likely());
+
+    build.SetInsertPoint(isTable);
+    llvm::Value* table = unit.load_pointer(rb);
+    llvm::Value* lsizenode = build.CreateZExt(unit.load_field(types.i8Ty, table, offsetof(LuaTable, lsizenode)), types.i32Ty);
+    llvm::Value* mask = build.CreateSub(build.CreateShl(build.getInt32(1), lsizenode), build.getInt32(1));
+    llvm::Value* slot = build.CreateZExt(build.CreateAnd(build.getInt32(key->hash), mask), types.i64Ty);
+    llvm::Value* nodes = unit.load_field(types.ptrTy, table, offsetof(LuaTable, node), "node");
+    llvm::Value* node = build.CreateInBoundsGEP(types.i8Ty, nodes, build.CreateMul(slot, build.getInt64(sizeof(LuaNode))), "n");
+    llvm::BasicBlock* own = unit.current_block();
+    build.CreateCondBr(node_holds(unit, node, key), found, inIndex);
+
+    // a key in the main position without a chain can't be anywhere else in the table
+    build.SetInsertPoint(inIndex);
+    llvm::Value* noNext = build.CreateICmpULT(unit.load_field(types.i32Ty, node, kNodeKeyTagOffset), build.getInt32(0x10));
+    llvm::Value* metatable = unit.load_field(types.ptrTy, table, offsetof(LuaTable, metatable), "mt");
+    build.CreateCondBr(build.CreateAnd(noNext, build.CreateIsNotNull(metatable)), hasIndex, slow);
+
+    build.SetInsertPoint(hasIndex);
+    llvm::Value* index = unit.call_native(reinterpret_cast<const void*>(&get_fast_tm), types.ptrTy, {unit.state(), metatable, build.getInt32(TM_INDEX)});
+    llvm::Value* indexIsTable = build.CreateAnd(
+        build.CreateIsNotNull(index),
+        build.CreateICmpEQ(unit.load_field(types.i32Ty, index, offsetof(TValue, tt)), build.getInt32(LUA_TTABLE))
+    );
+    build.CreateCondBr(indexIsTable, indexTable, slow);
+
+    build.SetInsertPoint(indexTable);
+    auto [hit, indexValue] = lookup_cached_slot(unit, unit.load_field(types.ptrTy, index, offsetof(TValue, value)), pcpos, key);
+    llvm::BasicBlock* inherited = unit.current_block();
+    build.CreateCondBr(hit, found, slow);
+
+    // rb can alias ra or ra + 1
+    build.SetInsertPoint(found);
+    llvm::PHINode* value = build.CreatePHI(types.ptrTy, 2, "method");
+    value->addIncoming(types.field_ptr(build, node, offsetof(LuaNode, val)), own);
+    value->addIncoming(indexValue, inherited);
+    llvm::Value* method = build.CreateLoad(types.tvalueTy, value);
+    llvm::Value* self = unit.load_reg(rb);
+    unit.store_reg(ra + 1, self);
+    unit.store_reg(ra, method);
+    build.CreateBr(unit.block_at(nextpc));
+
+    build.SetInsertPoint(slow);
+    unit.spill(pcpos);
+    unit.call_helper(reinterpret_cast<const void*>(&execute_namecall), pcpos, false);
+    unit.reload(pcpos);
     build.CreateBr(unit.block_at(nextpc));
 }
 
@@ -1174,7 +1709,7 @@ void lower_inst_settableks(TranslationUnit& unit, const Instruction* pc, int pcp
     llvm::BasicBlock* isTable = unit.new_block("table");
     llvm::BasicBlock* slow = unit.new_block("slow");
 
-    build.CreateCondBr(tag_is(unit, rb, LUA_TTABLE), isTable, slow);
+    build.CreateCondBr(tag_is(unit, rb, LUA_TTABLE), isTable, slow, unit.likely());
 
     build.SetInsertPoint(isTable);
     llvm::Value* table = unit.load_pointer(rb);
@@ -1182,7 +1717,7 @@ void lower_inst_settableks(TranslationUnit& unit, const Instruction* pc, int pcp
     llvm::Value* readonly = unit.load_field(types.i8Ty, table, offsetof(LuaTable, readonly));
 
     llvm::BasicBlock* fast = unit.new_block("fast");
-    build.CreateCondBr(build.CreateAnd(hit, build.CreateICmpEQ(readonly, build.getInt8(0))), fast, slow);
+    build.CreateCondBr(build.CreateAnd(hit, build.CreateICmpEQ(readonly, build.getInt8(0))), fast, slow, unit.likely());
 
     build.SetInsertPoint(fast);
     build.CreateStore(unit.load_reg(ra), value);
@@ -1192,7 +1727,7 @@ void lower_inst_settableks(TranslationUnit& unit, const Instruction* pc, int pcp
     build.SetInsertPoint(slow);
     unit.spill(pcpos);
     unit.call_helper(helper, pcpos, false);
-    unit.reload();
+    unit.reload(pcpos);
     build.CreateBr(unit.block_at(nextpc));
 }
 
@@ -1216,7 +1751,7 @@ static void lower_array_access(
     llvm::BasicBlock* candidate = unit.new_block("array.check");
     llvm::BasicBlock* slow = unit.new_block("slow");
 
-    build.CreateCondBr(isCandidate, candidate, slow);
+    build.CreateCondBr(isCandidate, candidate, slow, unit.likely());
 
     build.SetInsertPoint(candidate);
     llvm::Value* table = unit.load_pointer(rb);
@@ -1229,7 +1764,7 @@ static void lower_array_access(
         fastCond = build.CreateAnd(fastCond, build.CreateICmpEQ(unit.load_field(types.i8Ty, table, offsetof(LuaTable, readonly)), build.getInt8(0)));
 
     llvm::BasicBlock* fast = unit.new_block("array");
-    build.CreateCondBr(fastCond, fast, slow);
+    build.CreateCondBr(fastCond, fast, slow, unit.likely());
 
     build.SetInsertPoint(fast);
     llvm::Value* array = unit.load_field(types.ptrTy, table, offsetof(LuaTable, array), "array");
@@ -1240,7 +1775,7 @@ static void lower_array_access(
     build.SetInsertPoint(slow);
     unit.spill(pcpos);
     unit.call_helper(helper, pcpos, false);
-    unit.reload();
+    unit.reload(pcpos);
     build.CreateBr(unit.block_at(nextpc));
 }
 
@@ -1252,8 +1787,8 @@ static llvm::Value* array_index(TranslationUnit& unit, const int reg)
 
     llvm::Value* key = unit.load_number(reg);
 
-    // saturating conversion: unlike fptosi, it is defined for every input
-    llvm::Value* index = build.CreateIntrinsic(llvm::Intrinsic::fptosi_sat, {types.i32Ty, types.doubleTy}, {key});
+    // whatever an out of range or NaN key converts to, it doesn't convert back to the key
+    llvm::Value* index = build.CreateFreeze(build.CreateFPToSI(key, types.i32Ty));
     llvm::Value* exact = build.CreateFCmpOEQ(build.CreateSIToFP(index, types.doubleTy), key);
 
     return build.CreateSelect(exact, build.CreateSub(index, build.getInt32(1)), build.getInt32(-1), "index");
@@ -1273,15 +1808,15 @@ void lower_inst_gettable(TranslationUnit& unit, const Instruction* pc, int pcpos
     llvm::BasicBlock* slow = unit.new_block("slow");
 
     // the key is only read as a number once its tag says it is one
-    build.CreateCondBr(tag_is(unit, rb, LUA_TTABLE), checkKey, slow);
+    build.CreateCondBr(tag_is(unit, rb, LUA_TTABLE), checkKey, slow, unit.likely());
     build.SetInsertPoint(checkKey);
-    build.CreateCondBr(tag_is(unit, rc, LUA_TNUMBER), candidate, slow);
+    build.CreateCondBr(tag_is(unit, rc, LUA_TNUMBER), candidate, slow, unit.likely());
 
     build.SetInsertPoint(slow);
     const int nextpc = next_pc(pc, pcpos);
     unit.spill(pcpos);
     unit.call_helper(reinterpret_cast<const void*>(&execute_gettable), pcpos, false);
-    unit.reload();
+    unit.reload(pcpos);
     build.CreateBr(unit.block_at(nextpc));
 
     build.SetInsertPoint(candidate);
@@ -1313,15 +1848,15 @@ void lower_inst_settable(TranslationUnit& unit, const Instruction* pc, int pcpos
     llvm::BasicBlock* candidate = unit.new_block("candidate");
     llvm::BasicBlock* slow = unit.new_block("slow");
 
-    build.CreateCondBr(tag_is(unit, rb, LUA_TTABLE), checkKey, slow);
+    build.CreateCondBr(tag_is(unit, rb, LUA_TTABLE), checkKey, slow, unit.likely());
     build.SetInsertPoint(checkKey);
-    build.CreateCondBr(tag_is(unit, rc, LUA_TNUMBER), candidate, slow);
+    build.CreateCondBr(tag_is(unit, rc, LUA_TNUMBER), candidate, slow, unit.likely());
 
     build.SetInsertPoint(slow);
     const int nextpc = next_pc(pc, pcpos);
     unit.spill(pcpos);
     unit.call_helper(reinterpret_cast<const void*>(&execute_settable), pcpos, false);
-    unit.reload();
+    unit.reload(pcpos);
     build.CreateBr(unit.block_at(nextpc));
 
     build.SetInsertPoint(candidate);
@@ -1390,6 +1925,233 @@ void lower_inst_settablen(TranslationUnit& unit, const Instruction* pc, int pcpo
     );
 }
 
+// The result copy of execute_return and luau_poscall: 'count' values at 'vals' go to 'res', truncated or padded with
+// nil to 'nresults' unless that's LUA_MULTRET; returns the end of the results
+static llvm::Value* emit_move_results(TranslationUnit& unit, llvm::Value* res, llvm::Value* vals, llvm::Value* count, llvm::Value* nresults)
+{
+    llvm::IRBuilder<>& build = unit.builder();
+    const VmTypes& types = unit.types();
+
+    llvm::Value* multret = build.CreateICmpEQ(nresults, build.getInt64(LUA_MULTRET));
+    llvm::Value* wanted = build.CreateSelect(multret, count, nresults, "wanted");
+    llvm::Value* copied = build.CreateSelect(build.CreateICmpSLT(count, wanted), count, wanted, "copied");
+
+    // res is below vals, so copying forwards never overwrites a value that is still to be copied
+    llvm::BasicBlock* entry = unit.current_block();
+    llvm::BasicBlock* copy = unit.new_block("results.copy");
+    llvm::BasicBlock* pad = unit.new_block("results.pad");
+    llvm::BasicBlock* nil = unit.new_block("results.nil");
+    llvm::BasicBlock* done = unit.new_block("results.done");
+
+    build.CreateCondBr(build.CreateICmpSGT(copied, build.getInt64(0)), copy, pad);
+
+    build.SetInsertPoint(copy);
+    llvm::PHINode* i = build.CreatePHI(types.i64Ty, 2, "i");
+    i->addIncoming(build.getInt64(0), entry);
+    types.copy_tvalue(build, build.CreateGEP(types.tvalueTy, res, i), build.CreateGEP(types.tvalueTy, vals, i));
+    llvm::Value* nextI = build.CreateAdd(i, build.getInt64(1));
+    i->addIncoming(nextI, copy);
+    build.CreateCondBr(build.CreateICmpSLT(nextI, copied), copy, pad);
+
+    build.SetInsertPoint(pad);
+    build.CreateCondBr(build.CreateICmpSLT(copied, wanted), nil, done, unit.unlikely());
+
+    build.SetInsertPoint(nil);
+    llvm::PHINode* j = build.CreatePHI(types.i64Ty, 2, "j");
+    j->addIncoming(copied, pad);
+    llvm::Value* slot = build.CreateGEP(types.tvalueTy, res, j);
+    build.CreateStore(build.getInt32(LUA_TNIL), build.CreateStructGEP(types.tvalueTy, slot, VmTypes::kTValueTt));
+    llvm::Value* nextJ = build.CreateAdd(j, build.getInt64(1));
+    j->addIncoming(nextJ, nil);
+    build.CreateCondBr(build.CreateICmpSLT(nextJ, wanted), nil, done);
+
+    build.SetInsertPoint(done);
+    return build.CreateGEP(types.tvalueTy, res, wanted, "resend");
+}
+
+struct CallSetup
+{
+    llvm::Value* cl = nullptr;
+    llvm::Value* func = nullptr;
+    llvm::Value* argtop = nullptr;
+    // of the callee, in TValues
+    llvm::Value* stacksize = nullptr;
+    llvm::Value* ci = nullptr;
+};
+
+// The C function part of LOP_CALL in lvmexecute.cpp, once the stack and the call info array have room
+static void lower_c_call(TranslationUnit& unit, const Instruction* pc, const int pcpos, const CallSetup& setup, llvm::BasicBlock* done)
+{
+    llvm::IRBuilder<>& build = unit.builder();
+    const VmTypes& types = unit.types();
+
+    const int nresults = LUAU_INSN_C(*pc) - 1;
+    llvm::Value* state = unit.state();
+
+    unit.store_field(unit.insn_ptr(next_pc(pc, pcpos)), setup.ci, offsetof(CallInfo, savedpc));
+
+    llvm::Value* base = build.CreateConstGEP1_64(types.i8Ty, setup.func, sizeof(TValue), "newbase");
+    llvm::Value* top = build.CreateGEP(types.i8Ty, setup.argtop, build.CreateMul(setup.stacksize, build.getInt64(sizeof(TValue))), "newtop");
+
+    llvm::Value* newci = build.CreateConstGEP1_64(types.i8Ty, setup.ci, sizeof(CallInfo), "newci");
+    unit.store_field(newci, state, offsetof(lua_State, ci));
+    unit.store_field(setup.func, newci, offsetof(CallInfo, func));
+    unit.store_field(unit.load_field(types.ptrTy, setup.cl, offsetof(Closure, l.p), "p"), newci, offsetof(CallInfo, p));
+    unit.store_field(base, newci, offsetof(CallInfo, base));
+    unit.store_field(top, newci, offsetof(CallInfo, top));
+    unit.store_field(llvm::ConstantPointerNull::get(types.ptrTy), newci, offsetof(CallInfo, savedpc));
+    unit.store_field(build.getInt32(nresults), newci, offsetof(CallInfo, nresults));
+    unit.store_field(build.getInt32(0), newci, offsetof(CallInfo, flags));
+    unit.store_field(base, state, offsetof(lua_State, base));
+    unit.store_field(setup.argtop, state, offsetof(lua_State, top));
+
+    llvm::FunctionType* cfunctionTy = llvm::FunctionType::get(types.i32Ty, {types.ptrTy}, false);
+    llvm::Value* f = unit.load_field(types.ptrTy, setup.cl, offsetof(Closure, c.f), "f");
+    llvm::Value* n = build.CreateCall(cfunctionTy, f, {state}, "n");
+
+    llvm::BasicBlock* returned = unit.new_block("ccall.returned");
+    build.CreateCondBr(build.CreateICmpSLT(n, build.getInt32(0)), unit.yield_exit(), returned, unit.unlikely());
+
+    // the function can have reallocated the stack, and it's the call info at L->ci that gets popped
+    build.SetInsertPoint(returned);
+    llvm::Value* ci = types.load_state_ci(build, state);
+    llvm::Value* cip = build.CreateConstGEP1_64(types.i8Ty, ci, -int64_t(sizeof(CallInfo)), "cip");
+    llvm::Value* res = unit.load_field(types.ptrTy, ci, offsetof(CallInfo, func), "res");
+    llvm::Value* count = build.CreateSExt(n, types.i64Ty);
+    llvm::Value* vals = build.CreateGEP(types.tvalueTy, unit.load_field(types.ptrTy, state, offsetof(lua_State, top), "top"), build.CreateNeg(count));
+    llvm::Value* resEnd = emit_move_results(unit, res, vals, count, build.getInt64(nresults));
+
+    unit.store_field(cip, state, offsetof(lua_State, ci));
+    unit.store_field(unit.load_field(types.ptrTy, cip, offsetof(CallInfo, base), "base"), state, offsetof(lua_State, base));
+    llvm::Value* callerTop = nresults == LUA_MULTRET ? resEnd : unit.load_field(types.ptrTy, cip, offsetof(CallInfo, top), "top");
+    unit.store_field(callerTop, state, offsetof(lua_State, top));
+
+    build.CreateBr(done);
+}
+
+// The LOP_CALL of lvmexecute.cpp and the Lua part of luau_precall, for a callee that has generated code which is
+// entered directly, or a C function that is called directly. Everything is checked before the first store, so that
+// 'generic' can still do the whole call
+static void lower_native_call(TranslationUnit& unit, const Instruction* pc, const int pcpos, llvm::BasicBlock* generic, llvm::BasicBlock* done)
+{
+    llvm::IRBuilder<>& build = unit.builder();
+    const VmTypes& types = unit.types();
+
+    const int ra = LUAU_INSN_A(*pc);
+    const int nparams = LUAU_INSN_B(*pc) - 1;
+    const int nresults = LUAU_INSN_C(*pc) - 1;
+
+    auto require = [&](llvm::Value* cond, const char* name)
+    {
+        llvm::BasicBlock* next = unit.new_block(name);
+        build.CreateCondBr(cond, next, generic, unit.likely());
+        build.SetInsertPoint(next);
+    };
+
+    if (LUAU_INSN_OP(*pc) == LOP_CALLFB)
+    {
+        // the slot is sealed by the first call when nothing collects call targets, and collecting is left to the helper
+        llvm::Value* slot = build.CreateLoad(types.i32Ty, unit.insn_ptr(pcpos + 1), "fbslot");
+        require(build.CreateICmpEQ(slot, build.getInt32(LUAU_INSN_FBSLOT_SEALED)), "call.sealed");
+    }
+
+    require(tag_is(unit, ra, LUA_TFUNCTION), "call.function");
+
+    llvm::Value* cl = unit.load_pointer(ra);
+    llvm::Value* state = unit.state();
+    llvm::Value* func = unit.stack_slot(ra, "func");
+
+    // a variadic argument list ends at L->top, where the instruction that produced its tail left it
+    llvm::Value* argtop = nullptr;
+    llvm::Value* argcount = nullptr;
+
+    if (nparams == LUA_MULTRET)
+    {
+        argtop = unit.load_field(types.ptrTy, state, offsetof(lua_State, top), "argtop");
+        llvm::Value* args = build.CreatePtrDiff(types.tvalueTy, argtop, unit.stack_slot(ra + 1));
+        argcount = build.CreateTrunc(args, types.i32Ty, "nparams");
+    }
+    else
+    {
+        argtop = unit.stack_slot(ra + 1 + nparams, "argtop");
+        argcount = build.getInt32(nparams);
+    }
+    llvm::Value* stacksize = build.CreateZExt(unit.load_field(types.i8Ty, cl, offsetof(Closure, stacksize), "stacksize"), types.i64Ty);
+
+    // stacklimitreached with L->top at argtop, which leaves growing the stack to luaD_checkstackfornewci
+    llvm::Value* stackLast = unit.load_field(types.ptrTy, state, offsetof(lua_State, stack_last), "stack_last");
+    llvm::Value* room = build.CreatePtrDiff(types.i8Ty, stackLast, argtop);
+    require(build.CreateICmpSGT(room, build.CreateMul(stacksize, build.getInt64(sizeof(TValue)))), "call.stack");
+
+    // incr_ci, which leaves growing the array to luaD_growCI
+    llvm::Value* ci = unit.load_field(types.ptrTy, state, offsetof(lua_State, ci), "ci");
+    llvm::Value* endCi = unit.load_field(types.ptrTy, state, offsetof(lua_State, end_ci), "end_ci");
+    require(build.CreateICmpNE(ci, endCi), "call.ci");
+
+    llvm::BasicBlock* cCall = unit.new_block("call.c");
+    llvm::BasicBlock* luaCall = unit.new_block("call.lua");
+    build.CreateCondBr(build.CreateICmpNE(unit.load_field(types.i8Ty, cl, offsetof(Closure, isC), "isC"), build.getInt8(0)), cCall, luaCall);
+
+    build.SetInsertPoint(cCall);
+    lower_c_call(unit, pc, pcpos, {cl, func, argtop, stacksize, ci}, done);
+
+    build.SetInsertPoint(luaCall);
+    llvm::Value* proto = unit.load_field(types.ptrTy, cl, offsetof(Closure, l.p), "p");
+    llvm::Value* target = unit.load_field(types.ptrTy, proto, offsetof(Proto, exectarget), "exectarget");
+    llvm::Value* execdata = unit.load_field(types.ptrTy, proto, offsetof(Proto, execdata), "execdata");
+    require(build.CreateAnd(build.CreateIsNotNull(target), build.CreateIsNotNull(execdata)), "call.native");
+
+    // the call that reaches the threshold runs the hot callback, which is the helper's job
+    llvm::Value* hits = build.CreateAdd(unit.load_field(types.i32Ty, proto, offsetof(Proto, hits), "hits"), build.getInt32(1));
+    llvm::Value* threshold = build.CreateLoad(types.i32Ty, unit.const_ptr(&FInt::LuauNativeHitsThreshold.value), "threshold");
+    require(build.CreateICmpNE(hits, threshold), "call.enter");
+
+    unit.store_field(hits, proto, offsetof(Proto, hits));
+    unit.store_field(unit.insn_ptr(next_pc(pc, pcpos)), ci, offsetof(CallInfo, savedpc));
+
+    llvm::Value* base = build.CreateConstGEP1_64(types.i8Ty, func, sizeof(TValue), "newbase");
+    llvm::Value* top = build.CreateGEP(types.i8Ty, argtop, build.CreateMul(stacksize, build.getInt64(sizeof(TValue))), "newtop");
+
+    llvm::Value* newci = build.CreateConstGEP1_64(types.i8Ty, ci, sizeof(CallInfo), "newci");
+    unit.store_field(newci, state, offsetof(lua_State, ci));
+    unit.store_field(func, newci, offsetof(CallInfo, func));
+    unit.store_field(proto, newci, offsetof(CallInfo, p));
+    unit.store_field(base, newci, offsetof(CallInfo, base));
+    unit.store_field(top, newci, offsetof(CallInfo, top));
+    unit.store_field(unit.load_field(types.ptrTy, proto, offsetof(Proto, code), "code"), newci, offsetof(CallInfo, savedpc));
+    unit.store_field(build.getInt32(nresults), newci, offsetof(CallInfo, nresults));
+    unit.store_field(build.getInt32(LUA_CALLINFO_NATIVE), newci, offsetof(CallInfo, flags));
+    unit.store_field(base, state, offsetof(lua_State, base));
+
+    // fill unused parameters with nil
+    llvm::Value* numparams = build.CreateZExt(unit.load_field(types.i8Ty, proto, offsetof(Proto, numparams), "numparams"), types.i32Ty);
+    llvm::BasicBlock* fill = unit.new_block("call.fill");
+    llvm::BasicBlock* filled = unit.new_block("call.filled");
+    llvm::BasicBlock* entry = unit.current_block();
+
+    build.CreateCondBr(build.CreateICmpSGT(numparams, argcount), fill, filled, unit.unlikely());
+
+    build.SetInsertPoint(fill);
+    llvm::PHINode* arg = build.CreatePHI(types.i32Ty, 2, "arg");
+    arg->addIncoming(argcount, entry);
+    llvm::Value* slot = build.CreateGEP(types.tvalueTy, base, build.CreateZExt(arg, types.i64Ty));
+    build.CreateStore(build.getInt32(LUA_TNIL), build.CreateStructGEP(types.tvalueTy, slot, VmTypes::kTValueTt));
+    llvm::Value* nextArg = build.CreateAdd(arg, build.getInt32(1));
+    arg->addIncoming(nextArg, fill);
+    build.CreateCondBr(build.CreateICmpSLT(nextArg, numparams), fill, filled);
+
+    build.SetInsertPoint(filled);
+    llvm::Value* isVararg = build.CreateICmpNE(unit.load_field(types.i8Ty, proto, offsetof(Proto, is_vararg), "is_vararg"), build.getInt8(0));
+    llvm::Value* filledTop = build.CreateGEP(
+        types.tvalueTy,
+        base,
+        build.CreateZExt(build.CreateSelect(build.CreateICmpSGT(numparams, argcount), numparams, argcount), types.i64Ty)
+    );
+    unit.store_field(build.CreateSelect(isVararg, filledTop, top), state, offsetof(lua_State, top));
+
+    unit.emit_enter_native(target);
+}
+
 void lower_inst_call(TranslationUnit& unit, const Instruction* pc, int pcpos)
 {
     llvm::IRBuilder<>& build = unit.builder();
@@ -1399,9 +2161,14 @@ void lower_inst_call(TranslationUnit& unit, const Instruction* pc, int pcpos)
     unit.emit_safepoint(pcpos, false);
 
     unit.spill(pcpos);
+
+    llvm::BasicBlock* generic = unit.new_block("call.generic");
+    llvm::BasicBlock* done = unit.new_block("call.done");
+    lower_native_call(unit, pc, pcpos, generic, done);
+
+    build.SetInsertPoint(generic);
     llvm::Value* result = unit.call_helper(reinterpret_cast<const void*>(&execute_call), pcpos, true);
 
-    llvm::BasicBlock* done = unit.new_block("call.done");
     llvm::BasicBlock* enter = unit.new_block("call.enter");
 
     llvm::SwitchInst* dispatch = build.CreateSwitch(result, done, 2);
@@ -1412,11 +2179,95 @@ void lower_inst_call(TranslationUnit& unit, const Instruction* pc, int pcpos)
     unit.emit_resume_ci();
 
     build.SetInsertPoint(done);
-    unit.reload();
+    unit.reload(pcpos);
     build.CreateBr(unit.block_at(nextpc));
 
     // a Lua callee returns, and a yielded C function resumes, into the instruction that follows the call
     unit.mark_entry_point(nextpc);
+}
+
+static void emit_return_to_caller(TranslationUnit& unit, llvm::Value* ci)
+{
+    llvm::IRBuilder<>& build = unit.builder();
+    const VmTypes& types = unit.types();
+
+    llvm::Value* flags = unit.load_field(types.i32Ty, ci, offsetof(CallInfo, flags), "flags");
+    llvm::Value* exits = build.CreateICmpNE(build.CreateAnd(flags, build.getInt32(LUA_CALLINFO_RETURN)), build.getInt32(0));
+
+    llvm::BasicBlock* caller = unit.new_block("return.caller");
+    build.CreateCondBr(exits, unit.yield_exit(), caller);
+
+    build.SetInsertPoint(caller);
+    unit.emit_resume_ci();
+}
+
+// execute_return for a variadic sequence, which is already on the stack and ends at L->top
+static void lower_variadic_return(TranslationUnit& unit, const Instruction* pc, const int pcpos)
+{
+    llvm::IRBuilder<>& build = unit.builder();
+    const VmTypes& types = unit.types();
+
+    const int ra = LUAU_INSN_A(*pc);
+
+    unit.spill(pcpos);
+
+    llvm::Value* state = unit.state();
+    llvm::Value* ci = types.load_state_ci(build, state);
+    llvm::Value* nresults = build.CreateSExt(unit.load_field(types.i32Ty, ci, offsetof(CallInfo, nresults), "nresults"), types.i64Ty);
+    llvm::Value* multret = build.CreateICmpEQ(nresults, build.getInt64(LUA_MULTRET));
+
+    llvm::Value* res = unit.load_field(types.ptrTy, ci, offsetof(CallInfo, func), "res");
+    llvm::Value* vals = unit.stack_slot(ra, "vals");
+    llvm::Value* top = unit.load_field(types.ptrTy, state, offsetof(lua_State, top), "top");
+    llvm::Value* count = build.CreatePtrDiff(types.tvalueTy, top, vals, "count");
+    llvm::Value* resEnd = emit_move_results(unit, res, vals, count, nresults);
+
+    llvm::Value* cip = build.CreateConstGEP1_64(types.i8Ty, ci, -int64_t(sizeof(CallInfo)), "cip");
+    unit.store_field(cip, state, offsetof(lua_State, ci));
+    unit.store_field(unit.load_field(types.ptrTy, cip, offsetof(CallInfo, base), "base"), state, offsetof(lua_State, base));
+
+    unit.store_field(build.CreateSelect(multret, resEnd, unit.load_field(types.ptrTy, cip, offsetof(CallInfo, top), "top")), state, offsetof(lua_State, top));
+
+    emit_return_to_caller(unit, ci);
+}
+
+// The LOP_RETURN of lvmexecute.cpp when the caller wants at most the values that are returned, or all of them. The
+// values go straight from the registers to the caller's frame: nothing else in this frame is observable once it's
+// popped, because the collector never marks the stack above top and the compiler closes upvalues before returning
+static void lower_native_return(TranslationUnit& unit, const Instruction* pc, const int pcpos, llvm::BasicBlock* generic)
+{
+    llvm::IRBuilder<>& build = unit.builder();
+    const VmTypes& types = unit.types();
+
+    const int ra = LUAU_INSN_A(*pc);
+    const int b = LUAU_INSN_B(*pc) - 1;
+
+    LUAU_ASSERT(b != LUA_MULTRET);
+
+    llvm::Value* state = unit.state();
+    llvm::Value* ci = types.load_state_ci(build, state);
+    llvm::Value* nresults = unit.load_field(types.i32Ty, ci, offsetof(CallInfo, nresults), "nresults");
+    llvm::Value* multret = build.CreateICmpEQ(nresults, build.getInt32(LUA_MULTRET));
+
+    // values the caller doesn't want land in the slots the callee frame held, which nothing reads anymore
+    llvm::BasicBlock* fast = unit.new_block("return.fast");
+    build.CreateCondBr(build.CreateICmpSLE(nresults, build.getInt32(b)), fast, generic, unit.likely());
+
+    build.SetInsertPoint(fast);
+    llvm::Value* res = unit.load_field(types.ptrTy, ci, offsetof(CallInfo, func), "res");
+
+    for (int i = 0; i < b; i++)
+        types.copy_tvalue(build, build.CreateConstGEP1_64(types.tvalueTy, res, i), unit.reg_slot(ra + i));
+
+    llvm::Value* cip = build.CreateConstGEP1_64(types.i8Ty, ci, -int64_t(sizeof(CallInfo)), "cip");
+    unit.store_field(cip, state, offsetof(lua_State, ci));
+    unit.store_field(unit.load_field(types.ptrTy, cip, offsetof(CallInfo, base), "base"), state, offsetof(lua_State, base));
+
+    llvm::Value* resEnd = build.CreateConstGEP1_64(types.tvalueTy, res, b);
+    llvm::Value* top = build.CreateSelect(multret, resEnd, unit.load_field(types.ptrTy, cip, offsetof(CallInfo, top), "top"));
+    unit.store_field(top, state, offsetof(lua_State, top));
+
+    emit_return_to_caller(unit, ci);
 }
 
 void lower_inst_return(TranslationUnit& unit, const Instruction* pc, int pcpos)
@@ -1425,6 +2276,16 @@ void lower_inst_return(TranslationUnit& unit, const Instruction* pc, int pcpos)
 
     unit.emit_safepoint(pcpos, false);
 
+    if (LUAU_INSN_B(*pc) - 1 == LUA_MULTRET)
+    {
+        lower_variadic_return(unit, pc, pcpos);
+        return;
+    }
+
+    llvm::BasicBlock* generic = unit.new_block("return.generic");
+    lower_native_return(unit, pc, pcpos, generic);
+
+    build.SetInsertPoint(generic);
     unit.spill(pcpos);
     llvm::Value* resume = unit.call_helper(reinterpret_cast<const void*>(&execute_return), pcpos, true);
 
@@ -1470,6 +2331,7 @@ static void branch_on_relation(TranslationUnit& unit, llvm::Value* cond, const b
 void lower_inst_jumpifeq(TranslationUnit& unit, const Instruction* pc, int pcpos)
 {
     llvm::IRBuilder<>& build = unit.builder();
+    const VmTypes& types = unit.types();
 
     const int ra = LUAU_INSN_A(*pc);
     const int rb = static_cast<int>(pc[1]);
@@ -1478,12 +2340,28 @@ void lower_inst_jumpifeq(TranslationUnit& unit, const Instruction* pc, int pcpos
     const int target = getJumpTarget(*pc, pcpos);
     const int next = next_pc(pc, pcpos);
 
+    llvm::BasicBlock* number = unit.new_block("eq.number");
+    llvm::BasicBlock* slow = unit.new_block("eq.slow");
+
+    const BytecodeTypes& bcTypes = unit.bytecode().bcTypes[pcpos];
+
+    if (unit.speculates_on(bcTypes.a, LBC_TYPE_NUMBER) && unit.speculates_on(bcTypes.b, LBC_TYPE_NUMBER))
+    {
+        check_operand_tags(unit, pcpos, {{ra, bcTypes.a}, {rb, bcTypes.b}}, number, slow);
+
+        build.SetInsertPoint(number);
+        branch_on_relation(unit, build.CreateFCmpOEQ(unit.load_number(ra), unit.load_number(rb)), negated, target, next);
+
+        // every operand check exits, so this is unreachable
+        build.SetInsertPoint(slow);
+        build.CreateUnreachable();
+        return;
+    }
+
     llvm::Value* tagA = unit.load_tag(ra);
     llvm::Value* tagB = unit.load_tag(rb);
 
     llvm::BasicBlock* sameType = unit.new_block("eq.same");
-    llvm::BasicBlock* number = unit.new_block("eq.number");
-    llvm::BasicBlock* slow = unit.new_block("eq.slow");
     llvm::BasicBlock* different = unit.new_block("eq.different");
 
     build.CreateCondBr(build.CreateICmpEQ(tagA, tagB), sameType, different);
@@ -1492,16 +2370,71 @@ void lower_inst_jumpifeq(TranslationUnit& unit, const Instruction* pc, int pcpos
     build.SetInsertPoint(different);
     branch_on_relation(unit, build.getFalse(), negated, target, next);
 
+    llvm::BasicBlock* other = unit.new_block("eq.other");
+
     build.SetInsertPoint(sameType);
-    build.CreateCondBr(build.CreateICmpEQ(tagA, build.getInt32(LUA_TNUMBER)), number, slow);
+    build.CreateCondBr(build.CreateICmpEQ(tagA, build.getInt32(LUA_TNUMBER)), number, other, unit.likely());
 
     build.SetInsertPoint(number);
     branch_on_relation(unit, build.CreateFCmpOEQ(unit.load_number(ra), unit.load_number(rb)), negated, target, next);
 
+    // luaV_equalval, where tables, userdata and objects can have an __eq that runs even for the same one
+    llvm::BasicBlock* nil = unit.new_block("eq.nil");
+    llvm::BasicBlock* boolean = unit.new_block("eq.boolean");
+    llvm::BasicBlock* light = unit.new_block("eq.lightuserdata");
+    llvm::BasicBlock* identity = unit.new_block("eq.identity");
+    llvm::BasicBlock* table = unit.new_block("eq.table");
+
+    build.SetInsertPoint(other);
+    llvm::SwitchInst* dispatch = build.CreateSwitch(tagA, slow, 12);
+    dispatch->addCase(build.getInt32(LUA_TNIL), nil);
+    dispatch->addCase(build.getInt32(LUA_TBOOLEAN), boolean);
+    dispatch->addCase(build.getInt32(LUA_TLIGHTUSERDATA), light);
+
+    for (const int tag : {LUA_TINTEGER, LUA_TSTRING, LUA_TFUNCTION, LUA_TTHREAD, LUA_TBUFFER, LUA_TCLASS})
+        dispatch->addCase(build.getInt32(tag), identity);
+
+    dispatch->addCase(build.getInt32(LUA_TTABLE), table);
+
+#if LUA_VECTOR_DOUBLE == 0
+    llvm::BasicBlock* vector = unit.new_block("eq.vector");
+    dispatch->addCase(build.getInt32(LUA_TVECTOR), vector);
+
+    build.SetInsertPoint(vector);
+    branch_on_relation(unit, build.CreateAndReduce(build.CreateFCmpOEQ(unit.load_vector(ra), unit.load_vector(rb))), negated, target, next);
+#endif
+
+    build.SetInsertPoint(nil);
+    branch_on_relation(unit, build.getTrue(), negated, target, next);
+
+    // only the low half of the value holds the boolean
+    build.SetInsertPoint(boolean);
+    branch_on_relation(unit, build.CreateICmpEQ(unit.load_boolean(ra), unit.load_boolean(rb)), negated, target, next);
+
+    build.SetInsertPoint(light);
+    llvm::Value* sameTag = build.CreateICmpEQ(
+        unit.load_field(types.i32Ty, unit.reg_slot(ra), offsetof(TValue, extra)), unit.load_field(types.i32Ty, unit.reg_slot(rb), offsetof(TValue, extra))
+    );
+    branch_on_relation(unit, build.CreateAnd(build.CreateICmpEQ(unit.load_pointer(ra), unit.load_pointer(rb)), sameTag), negated, target, next);
+
+    build.SetInsertPoint(identity);
+    llvm::Value* bitsA = unit.load_field(types.i64Ty, unit.reg_slot(ra), offsetof(TValue, value));
+    llvm::Value* bitsB = unit.load_field(types.i64Ty, unit.reg_slot(rb), offsetof(TValue, value));
+    branch_on_relation(unit, build.CreateICmpEQ(bitsA, bitsB), negated, target, next);
+
+    // get_compTM finds no __eq when the first table has no metatable
+    llvm::BasicBlock* noMetatable = unit.new_block("eq.table.nomt");
+    build.SetInsertPoint(table);
+    llvm::Value* metatable = unit.load_field(types.ptrTy, unit.load_pointer(ra), offsetof(LuaTable, metatable));
+    build.CreateCondBr(build.CreateIsNull(metatable), noMetatable, slow, unit.likely());
+
+    build.SetInsertPoint(noMetatable);
+    branch_on_relation(unit, build.CreateICmpEQ(unit.load_pointer(ra), unit.load_pointer(rb)), negated, target, next);
+
     build.SetInsertPoint(slow);
     unit.spill(pcpos);
     llvm::Value* equal = unit.call_helper(reinterpret_cast<const void*>(&execute_equal), pcpos, true);
-    unit.reload();
+    unit.reload(pcpos);
     branch_on_relation(unit, build.CreateICmpNE(equal, build.getInt32(0)), negated, target, next);
 }
 
@@ -1519,9 +2452,12 @@ void lower_inst_jumpifcmp(TranslationUnit& unit, const Instruction* pc, int pcpo
     const int next = next_pc(pc, pcpos);
 
     llvm::BasicBlock* number = unit.new_block("cmp.number");
+    llvm::BasicBlock* other = unit.new_block("cmp.other");
+    llvm::BasicBlock* strings = unit.new_block("cmp.string");
     llvm::BasicBlock* slow = unit.new_block("cmp.slow");
 
-    build.CreateCondBr(build.CreateAnd(tag_is(unit, ra, LUA_TNUMBER), tag_is(unit, rb, LUA_TNUMBER)), number, slow);
+    const BytecodeTypes& bcTypes = unit.bytecode().bcTypes[pcpos];
+    check_operand_tags(unit, pcpos, {{ra, bcTypes.a}, {rb, bcTypes.b}}, number, other);
 
     // ordered comparisons are false for NaN, the NOT variants then take the jump just like the interpreter does
     build.SetInsertPoint(number);
@@ -1529,12 +2465,24 @@ void lower_inst_jumpifcmp(TranslationUnit& unit, const Instruction* pc, int pcpo
     llvm::Value* b = unit.load_number(rb);
     branch_on_relation(unit, lessEqual ? build.CreateFCmpOLE(a, b) : build.CreateFCmpOLT(a, b), negated, target, next);
 
+    build.SetInsertPoint(other);
+    llvm::Value* isString = build.CreateICmpEQ(unit.load_tag(ra), build.getInt32(LUA_TSTRING));
+    build.CreateCondBr(build.CreateAnd(isString, build.CreateICmpEQ(unit.load_tag(rb), build.getInt32(LUA_TSTRING))), strings, slow);
+
+    // luaV_strcmp neither allocates nor reads the stack, so nothing has to be spilled for it
+    build.SetInsertPoint(strings);
+    llvm::Value* order = unit.call_native(
+        reinterpret_cast<const void*>(&luaV_strcmp), unit.types().i32Ty, {unit.load_pointer(ra), unit.load_pointer(rb)}
+    );
+    llvm::Value* holds = lessEqual ? build.CreateICmpSLE(order, build.getInt32(0)) : build.CreateICmpSLT(order, build.getInt32(0));
+    branch_on_relation(unit, holds, negated, target, next);
+
     build.SetInsertPoint(slow);
     unit.spill(pcpos);
     const void* helper = lessEqual ? reinterpret_cast<const void*>(&execute_lessequal) : reinterpret_cast<const void*>(&execute_lessthan);
-    llvm::Value* holds = unit.call_helper(helper, pcpos, true);
-    unit.reload();
-    branch_on_relation(unit, build.CreateICmpNE(holds, build.getInt32(0)), negated, target, next);
+    llvm::Value* result = unit.call_helper(helper, pcpos, true);
+    unit.reload(pcpos);
+    branch_on_relation(unit, build.CreateICmpNE(result, build.getInt32(0)), negated, target, next);
 }
 
 void lower_inst_jumpxeqk(TranslationUnit& unit, const Instruction* pc, int pcpos)
@@ -1667,6 +2615,154 @@ static llvm::Value* number_arith(TranslationUnit& unit, const LuauOpcode op, llv
     }
 }
 
+enum class VectorForm : uint8_t
+{
+    VectorVector,
+    VectorNumber,
+    NumberVector,
+};
+
+// the operand combinations that lvmexecute.cpp handles inline for vectors
+static bool has_vector_form(const LuauOpcode op, const VectorForm form)
+{
+    switch (op)
+    {
+    case LOP_ADD:
+    case LOP_SUB:
+    case LOP_MINUS:
+        return form == VectorForm::VectorVector;
+    case LOP_MUL:
+    case LOP_DIV:
+        return true;
+    case LOP_IDIV:
+    case LOP_MULK:
+    case LOP_DIVK:
+    case LOP_IDIVK:
+        return form == VectorForm::VectorNumber;
+    case LOP_DIVRK:
+        return form == VectorForm::NumberVector;
+    default:
+        return false;
+    }
+}
+
+static bool may_hold(const TValue* k, const uint8_t type, const int tag)
+{
+    if (k)
+        return tag == LUA_TNUMBER;
+
+    return type == LBC_TYPE_ANY || type == (tag == LUA_TNUMBER ? LBC_TYPE_NUMBER : LBC_TYPE_VECTOR);
+}
+
+static llvm::Value* vector_operand(TranslationUnit& unit, const int reg, const TValue* k, const int tag)
+{
+    llvm::IRBuilder<>& build = unit.builder();
+    const VmTypes& types = unit.types();
+
+    if (tag == LUA_TVECTOR)
+        return unit.load_vector(reg);
+
+    llvm::Value* number = k ? llvm::ConstantFP::get(types.doubleTy, nvalue(k)) : unit.load_number(reg);
+
+    return build.CreateVectorSplat(LUA_VECTOR_SIZE, build.CreateFPTrunc(number, types.floatTy));
+}
+
+static llvm::Value* vector_arith(TranslationUnit& unit, const LuauOpcode op, llvm::Value* a, llvm::Value* b)
+{
+    llvm::IRBuilder<>& build = unit.builder();
+
+    switch (op)
+    {
+    case LOP_ADD:
+        return build.CreateFAdd(a, b);
+    case LOP_SUB:
+        return build.CreateFSub(a, b);
+    case LOP_MUL:
+    case LOP_MULK:
+        return build.CreateFMul(a, b);
+    case LOP_DIV:
+    case LOP_DIVK:
+    case LOP_DIVRK:
+        return build.CreateFDiv(a, b);
+    case LOP_IDIV:
+    case LOP_IDIVK:
+        return number_floor(unit, build.CreateFDiv(a, b));
+    case LOP_MINUS:
+        return build.CreateFNeg(a);
+    default:
+        LUAU_ASSERT(!"Unsupported vector opcode");
+        LUAU_UNREACHABLE();
+    }
+}
+
+// Lowers arithmetic that the bytecode types say involves a vector; returns false when no vector form applies, which
+// leaves the instruction to the number path
+static bool lower_vector_arith(
+    TranslationUnit& unit,
+    const int pcpos,
+    const LuauOpcode op,
+    const int ra,
+    const int regB,
+    const int regC,
+    const TValue* kb,
+    const TValue* kc,
+    const uint8_t typeB,
+    const uint8_t typeC,
+    const int nextpc
+)
+{
+    llvm::IRBuilder<>& build = unit.builder();
+
+    if (typeB != LBC_TYPE_VECTOR && typeC != LBC_TYPE_VECTOR)
+        return false;
+
+    std::vector<VectorForm> forms;
+
+    for (VectorForm form : {VectorForm::VectorVector, VectorForm::VectorNumber, VectorForm::NumberVector})
+    {
+        const int tagB = form == VectorForm::NumberVector ? LUA_TNUMBER : LUA_TVECTOR;
+        const int tagC = form == VectorForm::VectorNumber ? LUA_TNUMBER : LUA_TVECTOR;
+
+        if (has_vector_form(op, form) && may_hold(kb, typeB, tagB) && may_hold(kc, typeC, tagC))
+            forms.push_back(form);
+    }
+
+    if (forms.empty())
+        return false;
+
+    llvm::BasicBlock* slow = unit.new_block("slow");
+
+    for (size_t i = 0; i < forms.size(); i++)
+    {
+        const bool last = i + 1 == forms.size();
+        const int tagB = forms[i] == VectorForm::NumberVector ? LUA_TNUMBER : LUA_TVECTOR;
+        const int tagC = forms[i] == VectorForm::VectorNumber ? LUA_TNUMBER : LUA_TVECTOR;
+
+        llvm::BasicBlock* fast = unit.new_block("vector");
+        llvm::BasicBlock* failure = last ? slow : unit.new_block("vector.next");
+
+        // an operand can only be speculated on in the last form, the earlier ones fall through to the next
+        const uint8_t checkB = last ? typeB : uint8_t(LBC_TYPE_ANY);
+        const uint8_t checkC = last ? typeC : uint8_t(LBC_TYPE_ANY);
+        check_operand_tags(unit, pcpos, {{regB, checkB, tagB}, {regC, checkC, tagC}}, fast, failure);
+
+        build.SetInsertPoint(fast);
+        llvm::Value* a = vector_operand(unit, regB, kb, tagB);
+        llvm::Value* b = vector_operand(unit, regC, kc, tagC);
+        unit.store_vector(ra, vector_arith(unit, op, a, b));
+        build.CreateBr(unit.block_at(nextpc));
+
+        build.SetInsertPoint(failure);
+    }
+
+    unit.spill(pcpos);
+    unit.call_helper(reinterpret_cast<const void*>(&execute_arith), pcpos, false);
+    unit.reload(pcpos);
+    build.CreateBr(unit.block_at(nextpc));
+
+    return true;
+}
+
 void lower_inst_binary(TranslationUnit& unit, const Instruction* pc, int pcpos)
 {
     llvm::IRBuilder<>& build = unit.builder();
@@ -1716,27 +2812,30 @@ void lower_inst_binary(TranslationUnit& unit, const Instruction* pc, int pcpos)
         return;
     }
 
-    llvm::Value* fast = build.getTrue();
+    const BytecodeTypes& bcTypes = unit.bytecode().bcTypes[pcpos];
+    const int nextpc = next_pc(pc, pcpos);
 
-    if (regB >= 0)
-        fast = build.CreateAnd(fast, tag_is(unit, regB, LUA_TNUMBER));
-    if (regC >= 0 && regC != regB)
-        fast = build.CreateAnd(fast, tag_is(unit, regC, LUA_TNUMBER));
+    const uint8_t typeC = op == LOP_MINUS ? bcTypes.a : bcTypes.b;
 
-    lower_with_fallback(
-        unit,
-        fast,
-        reinterpret_cast<const void*>(&execute_arith),
-        pcpos,
-        next_pc(pc, pcpos),
-        [&]
-        {
-            llvm::Value* a = kb ? llvm::ConstantFP::get(types.doubleTy, nvalue(kb)) : unit.load_number(regB);
-            llvm::Value* b = kc ? llvm::ConstantFP::get(types.doubleTy, nvalue(kc)) : unit.load_number(regC);
+    if (lower_vector_arith(unit, pcpos, op, ra, regB, regC, kb, kc, bcTypes.a, typeC, nextpc))
+        return;
 
-            unit.store_number(ra, number_arith(unit, op, a, b, kc));
-        }
-    );
+    llvm::BasicBlock* fast = unit.new_block("fast");
+    llvm::BasicBlock* slow = unit.new_block("slow");
+
+    check_operand_tags(unit, pcpos, {{regB, bcTypes.a}, {regC, bcTypes.b}}, fast, slow);
+
+    build.SetInsertPoint(fast);
+    llvm::Value* a = kb ? llvm::ConstantFP::get(types.doubleTy, nvalue(kb)) : unit.load_number(regB);
+    llvm::Value* b = kc ? llvm::ConstantFP::get(types.doubleTy, nvalue(kc)) : unit.load_number(regC);
+    unit.store_number(ra, number_arith(unit, op, a, b, kc));
+    build.CreateBr(unit.block_at(nextpc));
+
+    build.SetInsertPoint(slow);
+    unit.spill(pcpos);
+    unit.call_helper(reinterpret_cast<const void*>(&execute_arith), pcpos, false);
+    unit.reload(pcpos);
+    build.CreateBr(unit.block_at(nextpc));
 }
 
 void lower_inst_logical(TranslationUnit& unit, const Instruction* pc, int pcpos)
@@ -1786,7 +2885,7 @@ void lower_inst_length(TranslationUnit& unit, const Instruction* pc, int pcpos)
     build.SetInsertPoint(isTable);
     llvm::Value* h = unit.load_pointer(rb);
     llvm::Value* metatable = unit.load_field(types.ptrTy, h, offsetof(LuaTable, metatable));
-    build.CreateCondBr(build.CreateIsNull(metatable), table, slow);
+    build.CreateCondBr(build.CreateIsNull(metatable), table, slow, unit.likely());
 
     // luaH_getn neither allocates nor reads the stack
     build.SetInsertPoint(table);
@@ -1795,7 +2894,7 @@ void lower_inst_length(TranslationUnit& unit, const Instruction* pc, int pcpos)
     build.CreateBr(unit.block_at(nextpc));
 
     build.SetInsertPoint(notTable);
-    build.CreateCondBr(build.CreateICmpEQ(tag, build.getInt32(LUA_TSTRING)), string, slow);
+    build.CreateCondBr(build.CreateICmpEQ(tag, build.getInt32(LUA_TSTRING)), string, slow, unit.likely());
 
     build.SetInsertPoint(string);
     llvm::Value* len = unit.load_field(types.i32Ty, unit.load_pointer(rb), offsetof(TString, len));
@@ -1805,14 +2904,84 @@ void lower_inst_length(TranslationUnit& unit, const Instruction* pc, int pcpos)
     build.SetInsertPoint(slow);
     unit.spill(pcpos);
     unit.call_helper(reinterpret_cast<const void*>(&execute_length), pcpos, false);
-    unit.reload();
+    unit.reload(pcpos);
     build.CreateBr(unit.block_at(nextpc));
+}
+
+namespace
+{
+
+struct RegDefVisitor
+{
+    int reg;
+    bool defined = false;
+
+    void def(const int r)
+    {
+        defined |= r == reg;
+    }
+
+    void def_range(const int start, const int count)
+    {
+        defined |= reg >= start && (count == -1 || reg < start + count);
+    }
+
+    void use(int) {}
+
+    void use_range(int, int) {}
+
+    void capture(int) {}
+};
+
+} // namespace
+
+// The step of the numeric loop that the FORNPREP at 'prepPc' starts, when its bytecode block ends up with a number
+// constant in the step register. Nothing writes that register while the loop runs, so the step stays that constant
+static std::optional<double> loop_step_constant(TranslationUnit& unit, const int prepPc)
+{
+    const BytecodeFunction& function = unit.bytecode();
+    Proto* proto = function.proto;
+    LUAU_ASSERT(LUAU_INSN_OP(proto->code[prepPc]) == LOP_FORNPREP);
+
+    const uint32_t blockIdx = function.cfg.blockAtPc[prepPc];
+    if (blockIdx == kNoAssociatedBlock)
+        return std::nullopt;
+
+    const int step = LUAU_INSN_A(proto->code[prepPc]) + 1;
+    std::optional<double> value;
+
+    for (int pcpos = function.bcBlocks[blockIdx].startpc; pcpos < prepPc;)
+    {
+        const Instruction* pc = &proto->code[pcpos];
+        const auto op = static_cast<LuauOpcode>(LUAU_INSN_OP(*pc));
+
+        RegDefVisitor visitor{step};
+        visit_bytecode_reg_defs_uses(visitor, proto, pcpos);
+
+        if (visitor.defined)
+        {
+            value.reset();
+
+            if (op == LOP_LOADN)
+                value = double(LUAU_INSN_D(*pc));
+            else if (op == LOP_LOADK && ttisnumber(&proto->k[LUAU_INSN_D(*pc)]))
+                value = nvalue(&proto->k[LUAU_INSN_D(*pc)]);
+        }
+
+        pcpos += getOpLength(op);
+    }
+
+    return value;
 }
 
 // step > 0 ? idx <= limit : limit <= idx, the condition FORNPREP and FORNLOOP share
 static llvm::Value* forn_condition(TranslationUnit& unit, llvm::Value* limit, llvm::Value* step, llvm::Value* idx)
 {
     llvm::IRBuilder<>& build = unit.builder();
+
+    // a constant step is the common case, and folding the select keeps the other comparison out of the loop
+    if (auto* constant = llvm::dyn_cast<llvm::ConstantFP>(step))
+        return constant->getValueAPF().convertToDouble() > 0 ? build.CreateFCmpOLE(idx, limit) : build.CreateFCmpOLE(limit, idx);
 
     llvm::Value* positive = build.CreateFCmpOGT(step, llvm::ConstantFP::get(unit.types().doubleTy, 0.0));
 
@@ -1833,7 +3002,7 @@ void lower_inst_fornprep(TranslationUnit& unit, const Instruction* pc, int pcpos
     llvm::BasicBlock* fast = unit.new_block("forn.fast");
     llvm::BasicBlock* slow = unit.new_block("forn.slow");
 
-    build.CreateCondBr(numbers, fast, slow);
+    build.CreateCondBr(numbers, fast, slow, unit.likely());
 
     build.SetInsertPoint(fast);
     llvm::Value* enter = forn_condition(unit, unit.load_number(ra), unit.load_number(ra + 1), unit.load_number(ra + 2));
@@ -1843,7 +3012,7 @@ void lower_inst_fornprep(TranslationUnit& unit, const Instruction* pc, int pcpos
     build.SetInsertPoint(slow);
     unit.spill(pcpos);
     llvm::Value* skip = unit.call_helper(reinterpret_cast<const void*>(&execute_fornprep), pcpos, true);
-    unit.reload();
+    unit.reload(pcpos);
     build.CreateCondBr(build.CreateICmpNE(skip, build.getInt32(0)), unit.block_at(target), unit.block_at(next));
 }
 
@@ -1857,7 +3026,19 @@ void lower_inst_fornloop(TranslationUnit& unit, const Instruction* pc, int pcpos
 
     // FORNPREP has made sure all three are numbers
     llvm::Value* limit = unit.load_number(ra);
-    llvm::Value* step = unit.load_number(ra + 1);
+    llvm::Value* step = nullptr;
+
+    const int loopStart = getJumpTarget(*pc, pcpos);
+    const Instruction* prep = &unit.bytecode().proto->code[loopStart - 1];
+
+    if (LUAU_INSN_OP(*prep) == LOP_FORNPREP && LUAU_INSN_A(*prep) == ra)
+    {
+        if (std::optional<double> constant = loop_step_constant(unit, loopStart - 1))
+            step = llvm::ConstantFP::get(unit.types().doubleTy, *constant);
+    }
+
+    if (!step)
+        step = unit.load_number(ra + 1);
     llvm::Value* idx = build.CreateFAdd(unit.load_number(ra + 2), step);
 
     unit.store_number(ra + 2, idx);
@@ -1867,23 +3048,166 @@ void lower_inst_fornloop(TranslationUnit& unit, const Instruction* pc, int pcpos
 
 void lower_inst_forgprep(TranslationUnit& unit, const Instruction* pc, int pcpos)
 {
-    const int target = getJumpTarget(*pc, pcpos);
+    llvm::IRBuilder<>& build = unit.builder();
+    const VmTypes& types = unit.types();
 
-    unit.spill(pcpos);
-    unit.call_helper(reinterpret_cast<const void*>(&execute_forgprep), pcpos, false);
-    unit.reload();
-    unit.builder().CreateBr(unit.block_at(target));
+    const auto op = static_cast<LuauOpcode>(LUAU_INSN_OP(*pc));
+    const int ra = LUAU_INSN_A(*pc);
+    const int target = getJumpTarget(*pc, pcpos);
+    const void* helper = reinterpret_cast<const void*>(&execute_forgprep);
+
+    if (op == LOP_FORGPREP)
+    {
+        unit.spill(pcpos);
+        unit.call_helper(helper, pcpos, false);
+        unit.reload(pcpos);
+        build.CreateBr(unit.block_at(target));
+        return;
+    }
+
+    // pairs and ipairs of a table set up builtin iteration, as long as nothing could have replaced them
+    llvm::Value* safeenv = unit.is_safe_env();
+    llvm::Value* state = op == LOP_FORGPREP_NEXT
+                             ? tag_is(unit, ra + 2, LUA_TNIL)
+                             : build.CreateAnd(
+                                   tag_is(unit, ra + 2, LUA_TNUMBER),
+                                   build.CreateFCmpOEQ(unit.load_number(ra + 2), llvm::ConstantFP::get(types.doubleTy, 0.0))
+                               );
+
+    lower_with_fallback(
+        unit,
+        build.CreateAnd(build.CreateAnd(safeenv, tag_is(unit, ra + 1, LUA_TTABLE)), state),
+        helper,
+        pcpos,
+        target,
+        [&]
+        {
+            unit.store_nil(ra);
+            unit.store_lightuserdata(ra + 2, llvm::ConstantPointerNull::get(types.ptrTy), LU_TAG_ITERATOR);
+        }
+    );
+}
+
+// The builtin table iteration of execute_forgloop
+static void lower_table_forgloop(TranslationUnit& unit, const Instruction* pc)
+{
+    llvm::IRBuilder<>& build = unit.builder();
+    const VmTypes& types = unit.types();
+
+    const int pcpos = static_cast<int>(pc - unit.bytecode().proto->code);
+    const int ra = LUAU_INSN_A(*pc);
+    const int aux = static_cast<int>(pc[1]);
+    llvm::BasicBlock* loop = unit.block_at(getJumpTarget(*pc, pcpos));
+    llvm::BasicBlock* exit = unit.block_at(next_pc(pc, pcpos));
+
+    llvm::Value* h = unit.load_pointer(ra + 1);
+    llvm::Value* index = build.CreateTrunc(unit.load_field(types.i64Ty, unit.reg_slot(ra + 2), offsetof(TValue, value)), types.i32Ty, "index");
+    llvm::Value* sizearray = unit.load_field(types.i32Ty, h, offsetof(LuaTable, sizearray), "sizearray");
+    llvm::Value* array = unit.load_field(types.ptrTy, h, offsetof(LuaTable, array), "array");
+
+    for (int i = 2; i < aux; i++)
+        unit.store_nil(ra + 3 + i);
+
+    auto is_nil = [&](llvm::Value* value)
+    {
+        return build.CreateICmpEQ(unit.load_field(types.i32Ty, value, offsetof(TValue, tt), "tt"), build.getInt32(LUA_TNIL));
+    };
+
+    // the value always goes to ra + 4, which isn't a loop variable of a loop with only one, and then only the stack has it
+    auto store_iteration = [&](llvm::Value* idx, llvm::Value* value)
+    {
+        llvm::Value* next = build.CreateAdd(idx, build.getInt32(1), "next");
+        unit.store_lightuserdata(ra + 2, build.CreateIntToPtr(build.CreateZExt(next, types.i64Ty), types.ptrTy), LU_TAG_ITERATOR);
+        types.copy_tvalue(build, (aux & 0xff) >= 2 ? unit.reg_slot(ra + 4) : unit.stack_slot(ra + 4), value);
+        return next;
+    };
+
+    llvm::BasicBlock* entry = unit.current_block();
+    llvm::BasicBlock* arrayFound = unit.new_block("forg.array.found");
+
+    build.SetInsertPoint(arrayFound);
+    llvm::PHINode* arrayIndex = build.CreatePHI(types.i32Ty, 2, "found");
+    llvm::Value* element = build.CreateGEP(types.tvalueTy, array, build.CreateZExt(arrayIndex, types.i64Ty), "e");
+    unit.store_number(ra + 3, build.CreateSIToFP(store_iteration(arrayIndex, element), types.doubleTy));
+    build.CreateBr(loop);
+
+    build.SetInsertPoint(entry);
+
+    if (aux < 0)
+    {
+        // ipairs stops at the first nil, and it never gets to the hash part
+        llvm::BasicBlock* check = unit.new_block("forg.check");
+        build.CreateCondBr(build.CreateICmpULT(index, sizearray), check, exit, unit.likely());
+
+        build.SetInsertPoint(check);
+        build.CreateCondBr(is_nil(build.CreateGEP(types.tvalueTy, array, build.CreateZExt(index, types.i64Ty))), exit, arrayFound, unit.unlikely());
+        arrayIndex->addIncoming(index, check);
+        return;
+    }
+
+    llvm::BasicBlock* arrayHead = unit.new_block("forg.array");
+    llvm::BasicBlock* arrayBody = unit.new_block("forg.array.body");
+    llvm::BasicBlock* nodeEntry = unit.new_block("forg.node.entry");
+    llvm::BasicBlock* nodeHead = unit.new_block("forg.node");
+    llvm::BasicBlock* nodeBody = unit.new_block("forg.node.body");
+    llvm::BasicBlock* nodeFound = unit.new_block("forg.node.found");
+    build.CreateBr(arrayHead);
+
+    build.SetInsertPoint(arrayHead);
+    llvm::PHINode* idx = build.CreatePHI(types.i32Ty, 2, "idx");
+    idx->addIncoming(index, entry);
+    build.CreateCondBr(build.CreateICmpULT(idx, sizearray), arrayBody, nodeEntry, unit.likely());
+
+    build.SetInsertPoint(arrayBody);
+    idx->addIncoming(build.CreateAdd(idx, build.getInt32(1)), arrayBody);
+    build.CreateCondBr(is_nil(build.CreateGEP(types.tvalueTy, array, build.CreateZExt(idx, types.i64Ty))), arrayHead, arrayFound);
+    arrayIndex->addIncoming(idx, arrayBody);
+
+    build.SetInsertPoint(nodeEntry);
+    llvm::Value* lsizenode = build.CreateZExt(unit.load_field(types.i8Ty, h, offsetof(LuaTable, lsizenode)), types.i32Ty);
+    llvm::Value* sizenode = build.CreateShl(build.getInt32(1), lsizenode, "sizenode");
+    llvm::Value* nodes = unit.load_field(types.ptrTy, h, offsetof(LuaTable, node), "node");
+    build.CreateBr(nodeHead);
+
+    build.SetInsertPoint(nodeHead);
+    llvm::PHINode* nidx = build.CreatePHI(types.i32Ty, 2, "nidx");
+    nidx->addIncoming(idx, nodeEntry);
+    llvm::Value* slot = build.CreateSub(nidx, sizearray);
+    build.CreateCondBr(build.CreateICmpULT(slot, sizenode), nodeBody, exit);
+
+    build.SetInsertPoint(nodeBody);
+    llvm::Value* node = build.CreateGEP(types.i8Ty, nodes, build.CreateMul(build.CreateZExt(slot, types.i64Ty), build.getInt64(sizeof(LuaNode))), "n");
+    nidx->addIncoming(build.CreateAdd(nidx, build.getInt32(1)), nodeBody);
+    build.CreateCondBr(is_nil(types.field_ptr(build, node, offsetof(LuaNode, val))), nodeHead, nodeFound);
+
+    // getnodekey, where the key tag shares its word with the chain
+    build.SetInsertPoint(nodeFound);
+    store_iteration(nidx, types.field_ptr(build, node, offsetof(LuaNode, val)));
+    types.copy_tvalue(build, unit.reg_slot(ra + 3), types.field_ptr(build, node, offsetof(LuaNode, key)));
+    llvm::Value* keyTag = build.CreateAnd(unit.load_field(types.i32Ty, node, kNodeKeyTagOffset), 0xf);
+    unit.store_field(keyTag, unit.reg_slot(ra + 3), offsetof(TValue, tt));
+    build.CreateBr(loop);
 }
 
 void lower_inst_forgloop(TranslationUnit& unit, const Instruction* pc, int pcpos)
 {
     llvm::IRBuilder<>& build = unit.builder();
 
+    const int ra = LUAU_INSN_A(*pc);
     const int target = getJumpTarget(*pc, pcpos);
     const int next = next_pc(pc, pcpos);
 
     unit.emit_safepoint(pcpos, true);
 
+    // FORGPREP* only leave nil in ra when ra + 1 is the table and ra + 2 the iteration index
+    llvm::BasicBlock* table = unit.new_block("forg.table");
+    llvm::BasicBlock* generic = unit.new_block("forg.generic");
+    build.CreateCondBr(build.CreateAnd(tag_is(unit, ra, LUA_TNIL), tag_is(unit, ra + 1, LUA_TTABLE)), table, generic, unit.likely());
+
+    build.SetInsertPoint(table);
+    lower_table_forgloop(unit, pc);
+
+    build.SetInsertPoint(generic);
     unit.spill(pcpos);
     llvm::Value* result = unit.call_helper(reinterpret_cast<const void*>(&execute_forgloop), pcpos, true);
 
@@ -1896,12 +3220,16 @@ void lower_inst_forgloop(TranslationUnit& unit, const Instruction* pc, int pcpos
     dispatch->addCase(build.getInt32(kForgloopYield), unit.yield_exit());
 
     build.SetInsertPoint(loop);
-    unit.reload();
+    unit.reload(pcpos);
     build.CreateBr(unit.block_at(target));
 
     build.SetInsertPoint(exit);
-    unit.reload();
+    unit.reload(pcpos);
     build.CreateBr(unit.block_at(next));
+
+    // luau_finishop resumes a yielded iterator call at either target
+    unit.mark_entry_point(target);
+    unit.mark_entry_point(next);
 }
 
 void lower_inst_fastcall(TranslationUnit& unit, const Instruction* pc, int pcpos)
@@ -1911,9 +3239,15 @@ void lower_inst_fastcall(TranslationUnit& unit, const Instruction* pc, int pcpos
     const int target = getJumpTarget(*pc, pcpos);
     const int next = next_pc(pc, pcpos);
 
+    llvm::BasicBlock* generic = unit.new_block("fastcall.generic");
+
+    if (!lower_builtin(unit, pc, pcpos, generic))
+        build.CreateBr(generic);
+
+    build.SetInsertPoint(generic);
     unit.spill(pcpos);
     llvm::Value* handled = unit.call_helper(reinterpret_cast<const void*>(&execute_fastcall), pcpos, true);
-    unit.reload();
+    unit.reload(pcpos);
 
     // the skip target isn't a block boundary, it's the instruction right past the paired CALL
     build.CreateCondBr(build.CreateICmpNE(handled, build.getInt32(0)), unit.block_at(target), unit.block_at(next));
@@ -1939,14 +3273,14 @@ void lower_inst_fastpcall(TranslationUnit& unit, const Instruction* pc, int pcpo
     dispatch->addCase(build.getInt32(kFastpcallYield), unit.yield_exit());
 
     build.SetInsertPoint(fallback);
-    unit.reload();
+    unit.reload(pcpos);
     build.CreateBr(unit.block_at(next));
 
     build.SetInsertPoint(enter);
     unit.emit_resume_ci();
 
     build.SetInsertPoint(done);
-    unit.reload();
+    unit.reload(pcpos);
     build.CreateBr(unit.block_at(target));
 
     // the protected call completes into the instruction past the paired CALL; an interrupt yield runs this one again
@@ -1972,11 +3306,11 @@ void lower_inst_namecalludata(TranslationUnit& unit, const Instruction* pc, int 
     dispatch->addCase(build.getInt32(kNamecalludataYield), unit.yield_exit());
 
     build.SetInsertPoint(fallback);
-    unit.reload();
+    unit.reload(pcpos);
     build.CreateBr(unit.block_at(next));
 
     build.SetInsertPoint(done);
-    unit.reload();
+    unit.reload(pcpos);
     build.CreateBr(unit.block_at(afterCall));
 
     unit.mark_entry_point(afterCall);
@@ -1991,7 +3325,7 @@ void lower_inst_finconstruct(TranslationUnit& unit, const Instruction* pc, int p
 
     unit.spill(pcpos);
     llvm::Value* handled = unit.call_helper(reinterpret_cast<const void*>(&execute_finconstruct), pcpos, true);
-    unit.reload();
+    unit.reload(pcpos);
 
     build.CreateCondBr(build.CreateICmpNE(handled, build.getInt32(0)), unit.block_at(target), unit.block_at(next));
 }
@@ -2044,7 +3378,7 @@ void lower_inst_helper(TranslationUnit& unit, const void* helper, int pcpos)
 
     unit.spill(pcpos);
     unit.call_helper(helper, pcpos, false);
-    unit.reload();
+    unit.reload(pcpos);
 }
 
 } // namespace Luau::Jit

@@ -49,6 +49,10 @@ struct ProtoStats
     // How many times the interpreter has handed control to generated code
     uint64_t calls = 0;
     ExecutionTier tier = ExecutionTier::Cold;
+    // How many times generated code left for the interpreter in the middle of the function
+    uint64_t exits = 0;
+    // Whether the generated code relies on bytecode types, which a function stops doing once it exits too often
+    bool speculative = false;
 };
 
 std::string to_string(const JITCompilationResult& result);

@@ -1010,8 +1010,10 @@ void analyze_bytecode_types(BytecodeFunction& function, const HostHooks& hostHoo
                     regTags[ra] = LBC_TYPE_NUMBER;
                 else if (bcType.a == LBC_TYPE_VECTOR && bcType.b == LBC_TYPE_VECTOR)
                     regTags[ra] = LBC_TYPE_VECTOR;
-                else if (hostHooks.userdataMetamethodBytecodeType &&
-                         (is_custom_userdata_bytecode_type(bcType.a) || is_custom_userdata_bytecode_type(bcType.b)))
+                else if (
+                    hostHooks.userdataMetamethodBytecodeType &&
+                    (is_custom_userdata_bytecode_type(bcType.a) || is_custom_userdata_bytecode_type(bcType.b))
+                )
                     regTags[ra] = hostHooks.userdataMetamethodBytecodeType(bcType.a, bcType.b, opcode_to_host_metamethod(op));
 
                 bcType.result = regTags[ra];
@@ -1042,8 +1044,10 @@ void analyze_bytecode_types(BytecodeFunction& function, const HostHooks& hostHoo
                     if (bcType.b == LBC_TYPE_NUMBER || bcType.b == LBC_TYPE_VECTOR)
                         regTags[ra] = LBC_TYPE_VECTOR;
                 }
-                else if (hostHooks.userdataMetamethodBytecodeType &&
-                         (is_custom_userdata_bytecode_type(bcType.a) || is_custom_userdata_bytecode_type(bcType.b)))
+                else if (
+                    hostHooks.userdataMetamethodBytecodeType &&
+                    (is_custom_userdata_bytecode_type(bcType.a) || is_custom_userdata_bytecode_type(bcType.b))
+                )
                 {
                     regTags[ra] = hostHooks.userdataMetamethodBytecodeType(bcType.a, bcType.b, opcode_to_host_metamethod(op));
                 }
@@ -1065,8 +1069,10 @@ void analyze_bytecode_types(BytecodeFunction& function, const HostHooks& hostHoo
 
                 if (bcType.a == LBC_TYPE_NUMBER && bcType.b == LBC_TYPE_NUMBER)
                     regTags[ra] = LBC_TYPE_NUMBER;
-                else if (hostHooks.userdataMetamethodBytecodeType &&
-                         (is_custom_userdata_bytecode_type(bcType.a) || is_custom_userdata_bytecode_type(bcType.b)))
+                else if (
+                    hostHooks.userdataMetamethodBytecodeType &&
+                    (is_custom_userdata_bytecode_type(bcType.a) || is_custom_userdata_bytecode_type(bcType.b))
+                )
                     regTags[ra] = hostHooks.userdataMetamethodBytecodeType(bcType.a, bcType.b, opcode_to_host_metamethod(op));
 
                 bcType.result = regTags[ra];
@@ -1088,8 +1094,10 @@ void analyze_bytecode_types(BytecodeFunction& function, const HostHooks& hostHoo
                     regTags[ra] = LBC_TYPE_NUMBER;
                 else if (bcType.a == LBC_TYPE_VECTOR && bcType.b == LBC_TYPE_VECTOR)
                     regTags[ra] = LBC_TYPE_VECTOR;
-                else if (hostHooks.userdataMetamethodBytecodeType &&
-                         (is_custom_userdata_bytecode_type(bcType.a) || is_custom_userdata_bytecode_type(bcType.b)))
+                else if (
+                    hostHooks.userdataMetamethodBytecodeType &&
+                    (is_custom_userdata_bytecode_type(bcType.a) || is_custom_userdata_bytecode_type(bcType.b))
+                )
                     regTags[ra] = hostHooks.userdataMetamethodBytecodeType(bcType.a, bcType.b, opcode_to_host_metamethod(op));
 
                 bcType.result = regTags[ra];
@@ -1120,8 +1128,10 @@ void analyze_bytecode_types(BytecodeFunction& function, const HostHooks& hostHoo
                     if (bcType.b == LBC_TYPE_NUMBER || bcType.b == LBC_TYPE_VECTOR)
                         regTags[ra] = LBC_TYPE_VECTOR;
                 }
-                else if (hostHooks.userdataMetamethodBytecodeType &&
-                         (is_custom_userdata_bytecode_type(bcType.a) || is_custom_userdata_bytecode_type(bcType.b)))
+                else if (
+                    hostHooks.userdataMetamethodBytecodeType &&
+                    (is_custom_userdata_bytecode_type(bcType.a) || is_custom_userdata_bytecode_type(bcType.b))
+                )
                 {
                     regTags[ra] = hostHooks.userdataMetamethodBytecodeType(bcType.a, bcType.b, opcode_to_host_metamethod(op));
                 }
@@ -1143,8 +1153,10 @@ void analyze_bytecode_types(BytecodeFunction& function, const HostHooks& hostHoo
 
                 if (bcType.a == LBC_TYPE_NUMBER && bcType.b == LBC_TYPE_NUMBER)
                     regTags[ra] = LBC_TYPE_NUMBER;
-                else if (hostHooks.userdataMetamethodBytecodeType &&
-                         (is_custom_userdata_bytecode_type(bcType.a) || is_custom_userdata_bytecode_type(bcType.b)))
+                else if (
+                    hostHooks.userdataMetamethodBytecodeType &&
+                    (is_custom_userdata_bytecode_type(bcType.a) || is_custom_userdata_bytecode_type(bcType.b))
+                )
                     regTags[ra] = hostHooks.userdataMetamethodBytecodeType(bcType.a, bcType.b, opcode_to_host_metamethod(op));
 
                 bcType.result = regTags[ra];
@@ -1165,8 +1177,10 @@ void analyze_bytecode_types(BytecodeFunction& function, const HostHooks& hostHoo
                     regTags[ra] = LBC_TYPE_NUMBER;
                 else if (bcType.a == LBC_TYPE_VECTOR && bcType.b == LBC_TYPE_VECTOR)
                     regTags[ra] = LBC_TYPE_VECTOR;
-                else if (hostHooks.userdataMetamethodBytecodeType &&
-                         (is_custom_userdata_bytecode_type(bcType.a) || is_custom_userdata_bytecode_type(bcType.b)))
+                else if (
+                    hostHooks.userdataMetamethodBytecodeType &&
+                    (is_custom_userdata_bytecode_type(bcType.a) || is_custom_userdata_bytecode_type(bcType.b))
+                )
                     regTags[ra] = hostHooks.userdataMetamethodBytecodeType(bcType.a, bcType.b, opcode_to_host_metamethod(op));
 
                 bcType.result = regTags[ra];
@@ -1195,8 +1209,10 @@ void analyze_bytecode_types(BytecodeFunction& function, const HostHooks& hostHoo
                     if (bcType.b == LBC_TYPE_NUMBER || bcType.b == LBC_TYPE_VECTOR)
                         regTags[ra] = LBC_TYPE_VECTOR;
                 }
-                else if (hostHooks.userdataMetamethodBytecodeType &&
-                         (is_custom_userdata_bytecode_type(bcType.a) || is_custom_userdata_bytecode_type(bcType.b)))
+                else if (
+                    hostHooks.userdataMetamethodBytecodeType &&
+                    (is_custom_userdata_bytecode_type(bcType.a) || is_custom_userdata_bytecode_type(bcType.b))
+                )
                 {
                     regTags[ra] = hostHooks.userdataMetamethodBytecodeType(bcType.a, bcType.b, opcode_to_host_metamethod(op));
                 }

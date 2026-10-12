@@ -52,6 +52,9 @@ enum ForgloopResult : int
 int execute_interrupt(lua_State* L, const Instruction* pc);
 int execute_safepoint(lua_State* L, const Instruction* pc);
 
+// fasttm, which doesn't touch the stack and can't raise an error
+const TValue* get_fast_tm(lua_State* L, LuaTable* mt, int event);
+
 void execute_getglobal(lua_State* L, const Instruction* pc);
 void execute_setglobal(lua_State* L, const Instruction* pc);
 void execute_setupval(lua_State* L, const Instruction* pc);

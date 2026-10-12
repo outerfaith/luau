@@ -8,6 +8,8 @@
 
 // The generated code must not run anymore, and the Proto must not be compiled again; this is what a breakpoint does
 #define NP_FLAG_INVALIDATED (1u << 0)
+// The code was compiled without speculating on bytecode types, because the speculative code kept leaving
+#define NP_FLAG_NO_SPECULATION (1u << 1)
 
 struct Proto;
 struct lua_State;
@@ -43,6 +45,8 @@ struct NativeProto
 
     ProtoStats stats;
     uint64_t entry = 0;
+    // incremented by generated code every time it leaves through a vm exit
+    uint32_t exits = 0;
     std::vector<DeoptPoint> deopts;
     uint32_t flags = 0;
 };
