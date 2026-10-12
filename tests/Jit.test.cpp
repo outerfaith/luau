@@ -1,4 +1,5 @@
 // This file is part of the Luau programming language and is licensed under MIT License; see LICENSE.txt for details
+#include "Luau/BytecodeUtils.h"
 #include "Luau/Compiler.h"
 #include "Luau/JitCompiler.h"
 
@@ -22,6 +23,8 @@
 
 LUAU_FASTINT(LuauNativeHitsThreshold)
 LUAU_FASTINT(LuauJitExitRecompileThreshold)
+LUAU_FASTINT(LuauJitTierUpThreshold)
+LUAU_FASTINT(LuauJitAggressiveThreshold)
 
 using namespace Luau;
 using namespace Luau::Jit;
@@ -426,6 +429,315 @@ TEST_CASE_FIXTURE(JitFixture, "WrongTypesLeaveSpeculativeCodeUntilItIsRecompiled
     CHECK(stats.calls == 6);
 }
 
+TEST_CASE_FIXTURE(JitFixture, "BaselineCodeTiersUpAndSpeculatesOnTheTypesItSaw")
+{
+    if (!jit_supported())
+        return;
+
+    ScopedFastInt tierUpThreshold(FInt::LuauJitTierUpThreshold, 10);
+    ScopedFastInt exitThreshold(FInt::LuauJitExitRecompileThreshold, 3);
+
+    create(L);
+
+    load(R"(
+        local function add(a, b)
+            return a + b
+        end
+
+        return add
+    )");
+
+    REQUIRE(lua_pcall(L, 0, 1, 0) == 0);
+    REQUIRE(compile(L, -1) == JITCompilationResult::Success);
+
+    auto call = [&](auto push)
+    {
+        lua_pushvalue(L, -1);
+        push();
+        push();
+        REQUIRE(lua_pcall(L, 2, 1, 0) == 0);
+        double result = lua_tonumber(L, -1);
+        lua_pop(L, 1);
+        return result;
+    };
+
+    auto number = [&]
+    {
+        lua_pushnumber(L, 2);
+    };
+    auto string = [&]
+    {
+        lua_pushstring(L, "2");
+    };
+
+    ProtoStats stats;
+
+    for (int i = 0; i < 9; i++)
+        CHECK(call(number) == 4.0);
+
+    REQUIRE(get_proto_stats(L, -1, stats));
+    CHECK(stats.tier == ExecutionTier::Baseline);
+
+    // the entry that runs out of the budget compiles the optimized tier, which the next call enters
+    CHECK(call(number) == 4.0);
+    CHECK(call(number) == 4.0);
+
+    REQUIRE(get_proto_stats(L, -1, stats));
+    CHECK(stats.tier == ExecutionTier::Optimized);
+    CHECK(stats.speculative);
+    CHECK(stats.exits == 0);
+    CHECK(stats.calls == 11);
+
+    // nothing was annotated, the guard comes from the numbers that baseline code saw
+    CHECK(call(string) == 4.0);
+    CHECK(call(string) == 4.0);
+
+    REQUIRE(get_proto_stats(L, -1, stats));
+    CHECK(stats.exits == 2);
+
+    // the exits recorded strings, so the next version checks the operands instead of leaving
+    CHECK(call(string) == 4.0);
+
+    REQUIRE(get_proto_stats(L, -1, stats));
+    CHECK(stats.tier == ExecutionTier::Optimized);
+    CHECK(stats.speculative);
+    CHECK(stats.exits == 0);
+
+    for (int i = 0; i < 5; i++)
+    {
+        CHECK(call(string) == 4.0);
+        CHECK(call(number) == 4.0);
+    }
+
+    REQUIRE(get_proto_stats(L, -1, stats));
+    CHECK(stats.exits == 0);
+    CHECK(stats.calls == 24);
+}
+
+TEST_CASE_FIXTURE(JitFixture, "LoopGuardsExitBeforeTheLoopAndRecordWhatTheyFound")
+{
+    if (!jit_supported())
+        return;
+
+    ScopedFastInt tierUpThreshold(FInt::LuauJitTierUpThreshold, 10);
+    ScopedFastInt exitThreshold(FInt::LuauJitExitRecompileThreshold, 3);
+
+    create(L);
+
+    load(R"(
+        local function sum(x, n)
+            local s, i = 0, 0
+            repeat
+                i += 1
+                s = s + x
+            until i >= n
+            return s
+        end
+
+        return sum
+    )");
+
+    REQUIRE(lua_pcall(L, 0, 1, 0) == 0);
+    REQUIRE(compile(L, -1) == JITCompilationResult::Success);
+
+    auto call = [&](auto push)
+    {
+        lua_pushvalue(L, -1);
+        push();
+        lua_pushnumber(L, 4);
+        REQUIRE(lua_pcall(L, 2, 1, 0) == 0);
+        double result = lua_tonumber(L, -1);
+        lua_pop(L, 1);
+        return result;
+    };
+
+    auto number = [&]
+    {
+        lua_pushnumber(L, 2);
+    };
+    auto string = [&]
+    {
+        lua_pushstring(L, "2");
+    };
+
+    ProtoStats stats;
+
+    for (int i = 0; i < 20; i++)
+        CHECK(call(number) == 8.0);
+
+    REQUIRE(get_proto_stats(L, -1, stats));
+    CHECK(stats.tier == ExecutionTier::Optimized);
+    CHECK(stats.exits == 0);
+
+    CHECK(call(string) == 8.0);
+    CHECK(call(string) == 8.0);
+
+    REQUIRE(get_proto_stats(L, -1, stats));
+    CHECK(stats.exits == 2);
+
+    // the interpreter ran the additions, the guards in front of the loop recorded the strings for the next version
+    CHECK(call(string) == 8.0);
+    CHECK(call(string) == 8.0);
+    CHECK(call(number) == 8.0);
+
+    REQUIRE(get_proto_stats(L, -1, stats));
+    CHECK(stats.tier == ExecutionTier::Optimized);
+    CHECK(stats.exits == 0);
+}
+
+TEST_CASE_FIXTURE(JitFixture, "IntegerLoopsTakeOverRunningLoopsAndExitForTheOnesTheyCantFollow")
+{
+    if (!jit_supported())
+        return;
+
+    ScopedFastInt tierUpThreshold(FInt::LuauJitTierUpThreshold, 10);
+
+    create(L);
+
+    load(R"(
+        local function sum(a, b)
+            local s = 0
+            for i = a, b do
+                s += i
+            end
+            return s
+        end
+
+        return sum
+    )");
+
+    REQUIRE(lua_pcall(L, 0, 1, 0) == 0);
+    REQUIRE(compile(L, -1) == JITCompilationResult::Success);
+
+    // the baseline code runs out of budget in the loop, and the optimized code picks the counter up from the index
+    lua_pushvalue(L, -1);
+    lua_pushnumber(L, 1);
+    lua_pushnumber(L, 100);
+    REQUIRE(lua_pcall(L, 2, 1, 0) == 0);
+    CHECK(lua_tonumber(L, -1) == 5050.0);
+    lua_pop(L, 1);
+
+    ProtoStats stats;
+    REQUIRE(get_proto_stats(L, -1, stats));
+    CHECK(stats.tier == ExecutionTier::Optimized);
+    CHECK(stats.exits == 0);
+
+    // a fractional start leaves for the interpreter before the loop
+    lua_pushvalue(L, -1);
+    lua_pushnumber(L, 0.5);
+    lua_pushnumber(L, 3);
+    REQUIRE(lua_pcall(L, 2, 1, 0) == 0);
+    CHECK(lua_tonumber(L, -1) == 0.5 + 1.5 + 2.5);
+    lua_pop(L, 1);
+
+    REQUIRE(get_proto_stats(L, -1, stats));
+    CHECK(stats.exits == 1);
+
+    // so does a limit that a counter would overflow on the way to
+    lua_pushvalue(L, -1);
+    lua_pushnumber(L, 2147483646);
+    lua_pushnumber(L, 2147483649);
+    REQUIRE(lua_pcall(L, 2, 1, 0) == 0);
+    CHECK(lua_tonumber(L, -1) == 4.0 * 2147483646 + 6);
+    lua_pop(L, 1);
+
+    REQUIRE(get_proto_stats(L, -1, stats));
+    CHECK(stats.exits == 2);
+}
+
+TEST_CASE_FIXTURE(JitFixture, "LoopSwitchesToTheNextTierInTheMiddleOfACall")
+{
+    if (!jit_supported())
+        return;
+
+    ScopedFastInt tierUpThreshold(FInt::LuauJitTierUpThreshold, 10);
+
+    create(L);
+
+    load(R"(
+        local function sum(t)
+            local s = 0
+            for i = 1, #t do
+                s = s + t[i]
+            end
+            return s
+        end
+
+        return sum
+    )");
+
+    REQUIRE(lua_pcall(L, 0, 1, 0) == 0);
+    REQUIRE(compile(L, -1) == JITCompilationResult::Success);
+
+    // numbers for long enough to run out of the budget, then a string that only the optimized code leaves for
+    lua_newtable(L);
+    for (int i = 1; i <= 50; i++)
+    {
+        lua_pushnumber(L, 1);
+        lua_rawseti(L, -2, i);
+    }
+    lua_pushstring(L, "1");
+    lua_rawseti(L, -2, 51);
+
+    lua_pushvalue(L, -2);
+    lua_pushvalue(L, -2);
+    REQUIRE(lua_pcall(L, 1, 1, 0) == 0);
+    CHECK(lua_tonumber(L, -1) == 51.0);
+    lua_pop(L, 2);
+
+    ProtoStats stats;
+    REQUIRE(get_proto_stats(L, -1, stats));
+    CHECK(stats.tier == ExecutionTier::Optimized);
+    CHECK(stats.calls == 1);
+    CHECK(stats.exits == 1);
+}
+
+TEST_CASE_FIXTURE(JitFixture, "OptimizedCodeTiersUpToAggressive")
+{
+    if (!jit_supported())
+        return;
+
+    ScopedFastInt tierUpThreshold(FInt::LuauJitTierUpThreshold, 10);
+    ScopedFastInt aggressiveThreshold(FInt::LuauJitAggressiveThreshold, 20);
+
+    create(L);
+
+    load(R"(
+        local function f(n)
+            local s = 0
+            for i = 1, n do
+                s += i
+            end
+            return s
+        end
+
+        return f
+    )");
+
+    REQUIRE(lua_pcall(L, 0, 1, 0) == 0);
+    REQUIRE(compile(L, -1) == JITCompilationResult::Success);
+
+    ProtoStats stats;
+
+    // each call spends an entry and a back edge per iteration, and switches tiers in the middle of its loop
+    for (const ExecutionTier expected : {ExecutionTier::Baseline, ExecutionTier::Optimized, ExecutionTier::Aggressive})
+    {
+        REQUIRE(get_proto_stats(L, -1, stats));
+        CHECK(stats.tier == expected);
+
+        lua_pushvalue(L, -1);
+        lua_pushnumber(L, 20);
+        REQUIRE(lua_pcall(L, 1, 1, 0) == 0);
+        CHECK(lua_tonumber(L, -1) == 210.0);
+        lua_pop(L, 1);
+    }
+
+    REQUIRE(get_proto_stats(L, -1, stats));
+    CHECK(stats.tier == ExecutionTier::Aggressive);
+    CHECK(stats.speculative);
+    CHECK(stats.calls == 3);
+}
+
 TEST_CASE("GeneratedCodeMatchesInterpreter")
 {
     if (!jit_supported())
@@ -579,21 +891,62 @@ TEST_CASE("GeneratedCodeMatchesInterpreter")
         "local s = {} for i = 1, 3 do s[#s + 1] = i end for i = 3, 1, -1 do s[#s + 1] = i end for i = 0, 1, 0.25 do s[#s + 1] = i end "
         "for i = 1, 3, 0/0 do s[#s + 1] = i end local st = #s > 0 and 2 or 1 for i = 1, 6, st do s[#s + 1] = i end "
         "for i = 5, 1 do s[#s + 1] = i end return table.concat(s, ',')",
+        // tables that only live in registers while allocations run the collector, and fields filled into their template keys
+        "local t = {} for i = 1, 3000 do local a = {x = i, y = {i}} local b = table.create(2, a) t[i] = b[2] end local s = 0 "
+        "for i = 1, 3000 do s += t[i].x + t[i].y[1] end return s, collectgarbage('count') > 0",
+        "local mt = {__newindex = function(t, k, v) rawset(t, k, v * 2) end} local a = 1 local o = setmetatable({x = a}, mt) o.x = nil "
+        "o.x = 5 local f = nil local m = {__index = f} local p = setmetatable({}, m) local before = p.foo m.__index = function() return "
+        "'hit' end return o.x, tostring(before), p.foo",
+        // setmetatable inline, and the frozen, locked and replaced metatables that it leaves to the library
+        "local mt = {__index = function() return 1 end} local r = {} for i = 1, 3 do local a = setmetatable({}, mt) "
+        "local ok1 = pcall(function() return setmetatable(table.freeze({}), mt) end) local b = setmetatable({}, {__metatable = 'locked'}) "
+        "local ok2, e2 = pcall(function() return setmetatable(b, mt) end) local c = setmetatable(setmetatable({}, mt), {}) "
+        "r[i] = table.concat({a.x, tostring(ok1), tostring(ok2), e2, tostring(getmetatable(c) == mt), getmetatable(b)}, ',') end "
+        "return table.concat(r, ';')",
+        // methods of strings, then a site that only ever saw strings getting a table and a number
+        "local function f(v, i) return v:upper() .. v:sub(i, i) end local r = {} for i = 1, 30 do r[i] = f('ab' .. i, i % 3 + 1) end "
+        "local o = {upper = function() return 'T' end, sub = function(_, i) return i end} local ok, e = pcall(f, 5, 1) "
+        "return table.concat(r, ','), f(o, 2), ok, e",
+        // loops that an integer counter can follow and ones it can't, at the same sites
+        "local function sum(a, b) local s = 0 for i = a, b, 1 do s += i end for i = b, a, -2 do s += i * 2 end return s end local r = {} "
+        "for k = 1, 20 do r[#r + 1] = sum(k, k + 10) end r[#r + 1] = sum(0.5, 4) r[#r + 1] = sum(1, 4.5) r[#r + 1] = sum(-3.5, -1) "
+        "r[#r + 1] = sum(2^31 - 3, 2^31 + 2) r[#r + 1] = sum(-2^31 - 2, -2^31 + 3) r[#r + 1] = sum('1', '3') r[#r + 1] = sum(1, 0/0) "
+        "local n = 0 for i = 1, math.huge do n += i if n > 100 then break end end r[#r + 1] = n local t = {} for i = 1, 10 do t[i] = i end "
+        "local s = 0 for i = 10, 1, -3 do s += t[i] end for i = -2^31, -2^31 + 2 do s += i end r[#r + 1] = s return table.concat(r, ',')",
+        // the array part of a table with a metatable, whose __index and __newindex only see the nil values
+        "local log = {} local mt = {__index = function(_, k) return 'i' .. k end, __newindex = function(t, k, v) log[#log + 1] = k "
+        "rawset(t, k, v) end} local t = setmetatable({1, 2, nil, 4}, mt) local r = {} for i = 1, 5 do r[#r + 1] = tostring(t[i]) end "
+        "for i = 1, 4 do t[i] = i * 10 end t[3] = nil r[#r + 1] = t[3] t[2] = t[2] + 1 r[#r + 1] = t[2] "
+        "local f = table.freeze(setmetatable({1}, mt)) local ok = pcall(function() f[1] = 2 end) "
+        "return table.concat(r, ','), table.concat(log, ','), ok, f[1]",
+        // a loop whose first block saw numbers getting other values on the way in and from inside
+        "local mt = {__add = function(a, b) return 1000 end} local function f(s, x, n) local i = 0 repeat s = s + x i += 1 if i == 5 and n > 50 "
+        "then s = setmetatable({}, mt) end until i >= n return tostring(s) end local r = {} for k = 1, 30 do r[#r + 1] = f(0, k, 10) end "
+        "r[#r + 1] = f(0, 1, 60) r[#r + 1] = f(setmetatable({}, mt), 1, 3) r[#r + 1] = f(0, '2', 4) r[#r + 1] = f(0.5, 1, 3) "
+        "return table.concat(r, ',')",
         // a dead register still reaches the stack before a call in the same block
         "local t = setmetatable({}, {__mode = 'k'}) local k = {} t[k] = 1 k = nil collectgarbage() return next(t) == nil",
     };
 
-    for (const char* snippet : snippets)
+    // with a budget this small, most functions go through the optimized tier and its exits before they finish
+    for (const int tierUpThreshold : {10000, 3})
     {
-        INFO(snippet);
+        ScopedFastInt tierUp(FInt::LuauJitTierUpThreshold, tierUpThreshold);
+        ScopedFastInt aggressive(FInt::LuauJitAggressiveThreshold, tierUpThreshold);
 
-        JitFixture interpreted;
-        JitFixture jit;
+        for (const char* snippet : snippets)
+        {
+            INFO(snippet);
+            INFO("tier-up threshold " << tierUpThreshold);
 
-        std::string expected = interpreted.run(snippet, false);
-        std::string actual = jit.run(snippet, true);
+            JitFixture interpreted;
+            JitFixture jit;
 
-        CHECK(expected == actual);
+            std::string expected = interpreted.run(snippet, false);
+            std::string actual = jit.run(snippet, true);
+
+            CHECK(expected == actual);
+        }
     }
 }
 
@@ -645,6 +998,76 @@ TEST_CASE_FIXTURE(JitFixture, "AnalysisWithoutTypeInfo")
     CHECK(function.bcTypeInfo.upvalueTypes.size() == size_t(proto->nups));
     CHECK(function.bcTypes.size() == size_t(proto->sizecode));
     CHECK(!function.bcBlocks.empty());
+}
+
+TEST_CASE_FIXTURE(JitFixture, "AllocationsStayReachableWhileTheCollectorRuns")
+{
+    if (!jit_supported())
+        return;
+
+    ScopedFastInt threshold(FInt::LuauNativeHitsThreshold, 1);
+
+    create(L);
+
+    // every assist does a lot of work, so cycles finish while a new table is still only in generated code
+    lua_gc(L, LUA_GCSETGOAL, 100);
+    lua_gc(L, LUA_GCSETSTEPMUL, 100000);
+    lua_gc(L, LUA_GCSETSTEPSIZE, 1);
+
+    load(R"(
+        local t = {}
+        for i = 1, 5000 do
+            local a = {x = i, y = {i, i}}
+            t[i] = a
+        end
+
+        local s = 0
+        for i = 1, 5000 do
+            s += t[i].x + t[i].y[1] + t[i].y[2]
+        end
+        return s
+    )");
+
+    REQUIRE(compile(L, -1) == JITCompilationResult::Success);
+    REQUIRE(lua_pcall(L, 0, 1, 0) == 0);
+    CHECK(lua_tonumber(L, -1) == 3.0 * 5000 * 5001 / 2);
+}
+
+TEST_CASE_FIXTURE(JitFixture, "AnalysisTakesOperandTypesFromFeedback")
+{
+    load("local function f(a: number, b, c: number, d) return a + b, c * d end return f", /* typeInfoLevel */ 1);
+
+    Proto* proto = proto_at(-1)->p[0];
+
+    std::vector<int> arith;
+    for (int pc = 0; pc < proto->sizecode; pc += getOpLength(LuauOpcode(LUAU_INSN_OP(proto->code[pc]))))
+    {
+        if (LUAU_INSN_OP(proto->code[pc]) == LOP_ADD || LUAU_INSN_OP(proto->code[pc]) == LOP_MUL)
+            arith.push_back(pc);
+    }
+
+    REQUIRE(arith.size() == 2);
+
+    HostHooks hooks;
+
+    BytecodeFunction declared;
+    analyze_bytecode(declared, proto, hooks);
+
+    CHECK(declared.bcTypes[arith[0]].a == LBC_TYPE_NUMBER);
+    CHECK(declared.bcTypes[arith[0]].b == LBC_TYPE_ANY);
+
+    // strings went through the annotated operand and only numbers through the other one; the multiplication never ran
+    TypeFeedback feedback(proto->sizecode, 0);
+    feedback[arith[0]] = (1u << LUA_TNUMBER | 1u << LUA_TSTRING) | (1u << LUA_TNUMBER) << 16;
+
+    BytecodeFunction observed;
+    analyze_bytecode(observed, proto, hooks, &feedback);
+
+    CHECK(observed.bcTypes[arith[0]].a == LBC_TYPE_ANY);
+    CHECK(observed.bcTypes[arith[0]].b == LBC_TYPE_NUMBER);
+    CHECK(observed.bcTypes[arith[0]].result == LBC_TYPE_ANY);
+    CHECK(observed.bcTypes[arith[1]].a == LBC_TYPE_NUMBER);
+    CHECK(observed.bcTypes[arith[1]].b == LBC_TYPE_ANY);
 }
 
 TEST_CASE_FIXTURE(JitFixture, "AnalysisRecoversBlocksAndEdges")

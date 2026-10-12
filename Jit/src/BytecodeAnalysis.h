@@ -59,6 +59,20 @@ struct BytecodeFunction
     BytecodeTypeInfo bcOriginalTypeInfo;
 };
 
+// Operand tags that generated code saw, per instruction: bit 'tag' of the low half for the first register that
+// feedback_operands lists, of the high half for the second
+using TypeFeedback = std::vector<uint32_t>;
+
+// The registers whose tags are recorded for the optimized tier, in the order of the bytecode types 'a' and 'b' of the
+// instruction; -1 when there is no such register
+std::array<int, 2> feedback_operands(const uint32_t* pc);
+
+// Instructions that record no operands keep flags of their own in their feedback instead
+// GETTABLE, SETTABLE, GETTABLEN, SETTABLEN: a table with a metatable left the fast path of an array part access
+constexpr uint32_t kFeedbackArrayMetatable = 1;
+// FORNPREP: a loop started that an int32 counter can't follow
+constexpr uint32_t kFeedbackLoopNotInteger = 1;
+
 bool is_custom_userdata_bytecode_type(uint8_t ty);
 
 void load_bytecode_type_info(BytecodeFunction& function);
@@ -69,7 +83,9 @@ void build_bytecode_blocks(BytecodeFunction& function);
 
 uint8_t get_reg_tag(std::array<uint8_t, 256>& regTags, BytecodeTypeInfo& bcTypeInfo, uint8_t reg, int pc);
 
-void analyze_bytecode_types(BytecodeFunction& function, const HostHooks& hostHooks);
-void analyze_bytecode(BytecodeFunction& function, Proto* proto, const HostHooks& hostHooks);
+// With feedback, the operands it covers get the type they always had at run time, or none when they had several, over
+// the declared one
+void analyze_bytecode_types(BytecodeFunction& function, const HostHooks& hostHooks, const TypeFeedback* feedback = nullptr);
+void analyze_bytecode(BytecodeFunction& function, Proto* proto, const HostHooks& hostHooks, const TypeFeedback* feedback = nullptr);
 
 } // namespace Luau::Jit

@@ -35,8 +35,9 @@ enum class ExecutionTier : uint8_t
     Cold = 0,
     // The function was called often enough for the interpreter to hand it over and has been compiled once
     Baseline = 1,
-    // Not yet implemented
+    // The baseline code ran long enough to be compiled again at O2, speculating on the operand types it saw
     Optimized = 2,
+    // The optimized code ran long enough to be compiled again at O3
     Aggressive = 3,
 
     Count = 4

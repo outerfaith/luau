@@ -31,7 +31,10 @@ public:
     void on_disable(lua_State* L, Proto* proto);
 
     JITCompilationResult compile(Proto* proto);
-    void recompile_without_speculation(Proto* proto);
+    // recompiles the code at the next tier, with the types recorded so far; nothing to do for code already replaced
+    void tier_up(NativeProto* caller);
+    // recompiles code whose guards keep failing, with the types the exits recorded or without speculation
+    void on_exit_threshold(Proto* proto);
     NativeProto* get_native_proto(Proto* proto);
 
 private:
@@ -43,8 +46,16 @@ private:
     JitCounters m_counters;
     bool m_countersUsed = false;
 
-    std::unique_ptr<NativeProto> compile_native(Proto* proto, bool speculate, JITCompilationResult& result);
+    // 'previous' is the code being replaced, whose stats and feedback carry over
+    std::unique_ptr<NativeProto> compile_native(
+        Proto* proto,
+        ExecutionTier tier,
+        bool speculate,
+        const NativeProto* previous,
+        JITCompilationResult& result
+    );
     void bind_native_proto(Proto* proto, std::unique_ptr<NativeProto> nproto);
+    void replace_native_proto(Proto* proto, std::unique_ptr<NativeProto> nproto);
 
     // code that was replaced can still be running in a frame below a helper call, so it is kept alive
     std::vector<std::unique_ptr<NativeProto>> m_retiredProtos;
@@ -52,5 +63,7 @@ private:
 
 // Called by generated code when its exit count reaches LuauJitExitRecompileThreshold
 void handle_exit_threshold(lua_State* L, Proto* proto);
+// Called by generated code whose tier-up budget has run out
+void handle_tier_up(lua_State* L, NativeProto* caller);
 
 } // namespace Luau::Jit

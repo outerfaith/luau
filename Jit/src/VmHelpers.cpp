@@ -104,6 +104,15 @@ const TValue* get_fast_tm(lua_State* L, LuaTable* mt, int event)
     return fasttm(L, mt, TMS(event));
 }
 
+LuaTable* get_namecall_index(lua_State* L, LuaTable* mt)
+{
+    if (fasttm(L, mt, TM_NAMECALL))
+        return nullptr;
+
+    const TValue* index = fasttm(L, mt, TM_INDEX);
+    return index && ttistable(index) ? hvalue(index) : nullptr;
+}
+
 int execute_interrupt(lua_State* L, const Instruction* pc)
 {
     return interrupt(L, pc) ? 1 : 0;
@@ -121,6 +130,12 @@ int execute_safepoint(lua_State* L, const Instruction* pc)
     }
 
     return 0;
+}
+
+void execute_gc_check(lua_State* L, const Instruction* pc)
+{
+    L->ci->savedpc = pc + getOpLength(LuauOpcode(LUAU_INSN_OP(*pc)));
+    luaC_checkGC(L);
 }
 
 void execute_getglobal(lua_State* L, const Instruction* pc)
@@ -873,26 +888,6 @@ void execute_length(lua_State* L, const Instruction* pc)
     {
         luaV_dolen(L, ra, rb);
     }
-}
-
-void execute_newtable(lua_State* L, const Instruction* pc)
-{
-    VM_FRAME(2);
-    StkId ra = VM_REG(LUAU_INSN_A(insn));
-    int b = LUAU_INSN_B(insn);
-
-    sethvalue(L, ra, luaH_new(L, pc[1], b == 0 ? 0 : (1 << (b - 1))));
-    luaC_checkGC(L);
-}
-
-void execute_duptable(lua_State* L, const Instruction* pc)
-{
-    VM_FRAME(1);
-    StkId ra = VM_REG(LUAU_INSN_A(insn));
-    TValue* kv = VM_KV(LUAU_INSN_D(insn));
-
-    sethvalue(L, ra, luaH_clone(L, hvalue(kv)));
-    luaC_checkGC(L);
 }
 
 void execute_setlist(lua_State* L, const Instruction* pc)

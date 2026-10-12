@@ -51,9 +51,14 @@ enum ForgloopResult : int
 // variant also runs the GC step back edges take
 int execute_interrupt(lua_State* L, const Instruction* pc);
 int execute_safepoint(lua_State* L, const Instruction* pc);
+// luaC_checkGC after an instruction that allocated, with savedpc past it like the interpreter's VM_PROTECT
+void execute_gc_check(lua_State* L, const Instruction* pc);
 
 // fasttm, which doesn't touch the stack and can't raise an error
 const TValue* get_fast_tm(lua_State* L, LuaTable* mt, int event);
+// the __index table that NAMECALL on a value of a type with the shared metatable mt looks methods up in, or null when
+// mt has a __namecall or no __index table; like get_fast_tm it doesn't touch the stack
+LuaTable* get_namecall_index(lua_State* L, LuaTable* mt);
 
 void execute_getglobal(lua_State* L, const Instruction* pc);
 void execute_setglobal(lua_State* L, const Instruction* pc);
@@ -83,8 +88,6 @@ int execute_lessthan(lua_State* L, const Instruction* pc);
 void execute_arith(lua_State* L, const Instruction* pc);
 void execute_concat(lua_State* L, const Instruction* pc);
 void execute_length(lua_State* L, const Instruction* pc);
-void execute_newtable(lua_State* L, const Instruction* pc);
-void execute_duptable(lua_State* L, const Instruction* pc);
 void execute_setlist(lua_State* L, const Instruction* pc);
 
 // Returns 1 when the loop body has to be skipped

@@ -8,6 +8,7 @@
 #include "Luau/BytecodeUtils.h"
 #include "Luau/Common.h"
 
+#include "lgc.h"
 #include "lstate.h"
 
 #include <llvm/IR/Constants.h>
@@ -187,6 +188,9 @@ bool match_signature(BuiltinCall& call)
         return nparams == 3 ? fixed({LUA_TNUMBER, LUA_TNUMBER, LUA_TNUMBER}) : fixed({LUA_TNUMBER, LUA_TNUMBER, LUA_TNUMBER, LUA_TNUMBER});
     case LBF_TYPE:
         return fixed({kAnyTag});
+    case LBF_SETMETATABLE:
+        // the barrier needs the metatable in a register
+        return fixed({LUA_TTABLE, LUA_TTABLE}) && !call.args[1].k;
     case LBF_STRING_LEN:
         return fixed({LUA_TSTRING});
     case LBF_STRING_BYTE:
@@ -446,6 +450,22 @@ void BuiltinLowering::lower()
 
         // type names are fixed strings that the collector never frees
         m_unit.store_object(m_call.ra, name, LUA_TSTRING);
+        return;
+    }
+    case LBF_SETMETATABLE:
+    {
+        llvm::Value* table = m_unit.load_pointer(m_call.args[0].reg);
+        llvm::Value* readonly = m_unit.load_field(m_types.i8Ty, table, offsetof(LuaTable, readonly));
+        llvm::Value* metatable = m_unit.load_field(m_types.ptrTy, table, offsetof(LuaTable, metatable));
+
+        // luauF_setmetatable leaves frozen tables and the __metatable check of replacing a metatable to the library
+        require(m_build.CreateAnd(m_build.CreateICmpEQ(readonly, m_build.getInt8(0)), m_build.CreateIsNull(metatable)));
+
+        const int mtReg = m_call.args[1].reg;
+        m_unit.store_field(m_unit.load_pointer(mtReg), table, offsetof(LuaTable, metatable));
+        m_unit.emit_barrier(table, mtReg, reinterpret_cast<const void*>(&luaC_barrierf));
+
+        m_unit.store_object(m_call.ra, table, LUA_TTABLE);
         return;
     }
     case LBF_STRING_LEN:

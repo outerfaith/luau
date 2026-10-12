@@ -26,12 +26,17 @@ LUAU_FASTFLAGVARIABLE(DebugLuauJitCounters)
 LUAU_FASTFLAGVARIABLE(DebugLuauJitPerfMap)
 LUAU_FASTFLAGVARIABLE(DebugLuauJitDumpObjects)
 LUAU_FASTINTVARIABLE(LuauJitExitRecompileThreshold, 64)
+LUAU_FASTINTVARIABLE(LuauJitTierUpThreshold, 10000)
+LUAU_FASTINTVARIABLE(LuauJitAggressiveThreshold, 100000)
 
 namespace Luau::Jit
 {
 
 // The interpreter starts a natively compiled function by executing this instruction, which hands control to 'enter'
 static constexpr Instruction kCodeEntryInsn = LOP_NATIVECALL;
+
+// how many times the optimized tier is compiled again with the types its exits saw before it stops speculating
+static constexpr uint32_t kMaxRespeculations = 4;
 
 JitContext::JitContext(std::unique_ptr<llvm::orc::LLJIT> jit)
     : m_jit(std::move(jit))
@@ -280,7 +285,28 @@ void JitContext::on_disable(lua_State* L, Proto* proto)
 void handle_exit_threshold(lua_State* L, Proto* proto)
 {
     if (JitContext* ctx = get_jit_context(L))
-        ctx->recompile_without_speculation(proto);
+        ctx->on_exit_threshold(proto);
+}
+
+void handle_tier_up(lua_State* L, NativeProto* caller)
+{
+    if (JitContext* ctx = get_jit_context(L))
+        ctx->tier_up(caller);
+}
+
+// entries and back edges until code at 'tier' is compiled at the next one, zero when it isn't
+static int32_t tier_up_budget(const ExecutionTier tier)
+{
+    switch (tier)
+    {
+    case ExecutionTier::Baseline:
+        return FInt::LuauJitTierUpThreshold;
+    case ExecutionTier::Optimized:
+        // only baseline code records feedback, so there is no tier above it without one
+        return FInt::LuauJitTierUpThreshold > 0 ? FInt::LuauJitAggressiveThreshold : 0;
+    default:
+        return 0;
+    }
 }
 
 static llvm::OptimizationLevel get_optimization_level(const ExecutionTier tier)
@@ -333,7 +359,7 @@ JITCompilationResult JitContext::compile(Proto* proto)
         return JITCompilationResult::NothingToCompile;
 
     JITCompilationResult result = JITCompilationResult::Success;
-    std::unique_ptr<NativeProto> nproto = compile_native(proto, /* speculate */ true, result);
+    std::unique_ptr<NativeProto> nproto = compile_native(proto, ExecutionTier::Baseline, /* speculate */ true, nullptr, result);
 
     // Nothing is handed over to the interpreter, and nothing is remembered about the Proto, until the code is ready; a
     // failed attempt leaves the Proto exactly as it was and can be retried
@@ -345,39 +371,82 @@ JITCompilationResult JitContext::compile(Proto* proto)
     return JITCompilationResult::Success;
 }
 
-void JitContext::recompile_without_speculation(Proto* proto)
+void JitContext::tier_up(NativeProto* caller)
+{
+    LUAU_ASSERT(caller && caller->proto);
+
+    Proto* proto = caller->proto;
+
+    // frames of replaced code ask too, before they switch over
+    if (get_native_proto(proto) != caller || caller->flags & NP_FLAG_INVALIDATED)
+        return;
+
+    LUAU_ASSERT(caller->stats.tier == ExecutionTier::Baseline || caller->stats.tier == ExecutionTier::Optimized);
+    const ExecutionTier next = caller->stats.tier == ExecutionTier::Baseline ? ExecutionTier::Optimized : ExecutionTier::Aggressive;
+
+    // the baseline only gives up on annotations, which feedback overrides; above it, giving up is for good
+    const bool speculate = caller->stats.tier == ExecutionTier::Baseline || !(caller->flags & NP_FLAG_NO_SPECULATION);
+
+    JITCompilationResult result = JITCompilationResult::Success;
+
+    if (std::unique_ptr<NativeProto> nproto = compile_native(proto, next, speculate, caller, result))
+        replace_native_proto(proto, std::move(nproto));
+    else
+        caller->tierUpBudget = INT32_MAX; // the code stays, and doesn't ask again for a long time
+}
+
+void JitContext::on_exit_threshold(Proto* proto)
 {
     LUAU_ASSERT(proto);
 
-    auto it = m_nativeProtos.find(proto);
-    if (it == m_nativeProtos.end() || it->second->flags & (NP_FLAG_INVALIDATED | NP_FLAG_NO_SPECULATION))
+    const NativeProto* current = get_native_proto(proto);
+    if (!current || current->flags & (NP_FLAG_INVALIDATED | NP_FLAG_NO_SPECULATION))
         return;
 
+    // the exits recorded the tags that failed the guards, so the tiers above the baseline can speculate again without
+    // those guards; the baseline speculates on annotations, which exits don't change, so it stops
+    const bool respeculate = current->stats.tier != ExecutionTier::Baseline && current->respeculations < kMaxRespeculations;
+
     JITCompilationResult result = JITCompilationResult::Success;
-    std::unique_ptr<NativeProto> nproto = compile_native(proto, /* speculate */ false, result);
+    std::unique_ptr<NativeProto> nproto = compile_native(proto, current->stats.tier, respeculate, current, result);
 
     // the speculative code keeps working, it just keeps leaving
     if (!nproto)
         return;
 
-    nproto->stats = it->second->stats;
+    if (respeculate)
+        nproto->respeculations++;
 
-    m_retiredProtos.push_back(std::move(it->second));
-    it->second = std::move(nproto);
-
-    // frames that are already running the old code are resumed through exectarget, which picks up the new code at
-    // the same entry pcs
-    proto->execdata = it->second.get();
-    proto->exectarget = it->second->entry;
+    replace_native_proto(proto, std::move(nproto));
 }
 
-std::unique_ptr<NativeProto> JitContext::compile_native(Proto* proto, const bool speculate, JITCompilationResult& result)
+std::unique_ptr<NativeProto> JitContext::compile_native(
+    Proto* proto,
+    const ExecutionTier tier,
+    const bool speculate,
+    const NativeProto* previous,
+    JITCompilationResult& result
+)
 {
     LUAU_ASSERT(proto);
+    LUAU_ASSERT(tier == ExecutionTier::Baseline || (previous && previous->feedback));
 
     auto owned = std::make_unique<NativeProto>();
     owned->proto = proto;
-    owned->stats.tier = ExecutionTier::Baseline;
+
+    if (previous)
+    {
+        owned->stats = previous->stats;
+        owned->feedback = previous->feedback;
+        owned->respeculations = previous->respeculations;
+    }
+    else if (FInt::LuauJitTierUpThreshold > 0)
+    {
+        owned->feedback = std::make_shared<TypeFeedback>(proto->sizecode, 0);
+    }
+
+    owned->stats.tier = tier;
+    owned->tierUpBudget = tier_up_budget(tier);
 
     if (!speculate)
         owned->flags |= NP_FLAG_NO_SPECULATION;
@@ -385,7 +454,7 @@ std::unique_ptr<NativeProto> JitContext::compile_native(Proto* proto, const bool
     NativeProto* nproto = owned.get();
 
     BytecodeFunction function;
-    analyze_bytecode(function, proto, m_hostHooks);
+    analyze_bytecode(function, proto, m_hostHooks, tier == ExecutionTier::Baseline ? nullptr : nproto->feedback.get());
 
     std::string name = "luau_jit_" + std::to_string(m_nextFunctionId++);
 
@@ -491,6 +560,23 @@ void JitContext::bind_native_proto(Proto* proto, std::unique_ptr<NativeProto> np
     proto->execdata = tracked;
     proto->exectarget = tracked->entry;
     proto->codeentry = &kCodeEntryInsn;
+}
+
+void JitContext::replace_native_proto(Proto* proto, std::unique_ptr<NativeProto> nproto)
+{
+    LUAU_ASSERT(proto);
+    LUAU_ASSERT(nproto && nproto->entry);
+
+    auto it = m_nativeProtos.find(proto);
+    LUAU_ASSERT(it != m_nativeProtos.end());
+
+    m_retiredProtos.push_back(std::move(it->second));
+    it->second = std::move(nproto);
+
+    // frames that are already running the old code are resumed through exectarget, which picks up the new code at
+    // the same entry pcs
+    proto->execdata = it->second.get();
+    proto->exectarget = it->second->entry;
 }
 
 } // namespace Luau::Jit

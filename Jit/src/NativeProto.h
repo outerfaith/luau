@@ -1,9 +1,12 @@
 // This file is part of the Luau programming language and is licensed under MIT License; see LICENSE.txt for details
 #pragma once
 
+#include "BytecodeAnalysis.h"
+
 #include "Luau/JitCompiler.h"
 
 #include <cstdint>
+#include <memory>
 #include <vector>
 
 // The generated code must not run anymore, and the Proto must not be compiled again; this is what a breakpoint does
@@ -49,6 +52,15 @@ struct NativeProto
     uint32_t exits = 0;
     std::vector<DeoptPoint> deopts;
     uint32_t flags = 0;
+
+    // shared by every version of the code for the Proto, because a replaced version can still be running and recording;
+    // null when there is no tier to profile for
+    std::shared_ptr<TypeFeedback> feedback;
+    // code below the top tier counts it down at entries and back edges, and asks for the next tier when it reaches
+    // zero; code that doesn't tier up starts at zero
+    int32_t tierUpBudget = 0;
+    // how many times the optimized tier was compiled again with the types its exits saw
+    uint32_t respeculations = 0;
 };
 
 } // namespace Luau::Jit

@@ -24,6 +24,19 @@ namespace Luau::Jit
 
 struct BytecodeFunction;
 
+// A numeric loop with a constant integer step whose index the speculating upper tiers count in an int32 alongside the
+// index register: FORNPREP checks that the start and limit allow it, and the register holds the counter converted to a
+// number whenever anything else can see it, so the loop body indexes arrays without converting back and forth
+struct IntegerLoop
+{
+    int prepPc = -1;
+    int loopPc = -1;
+    // the index register, A + 2 of FORNPREP and FORNLOOP
+    int reg = -1;
+    int step = 0;
+    llvm::AllocaInst* counter = nullptr;
+};
+
 // VM registers live in allocas while generated code runs, and the VM stack is only brought up to date around calls
 // into the VM. Before anything that can run Lua code, collect garbage or inspect the frame, every register that may
 // have been written since the last call is spilled to the stack, and afterwards the ones the call might have changed
@@ -135,6 +148,8 @@ public:
 
     // Runs the interrupt (and the GC step on back edges) the interpreter runs at the start of the instruction
     void emit_safepoint(int pcpos, bool backedge);
+    // luaC_checkGC after the instruction allocated the object in 'reg', which so far is only in its register slot
+    void emit_gc_check(int pcpos, int reg);
     // Continues in the frame at L->ci, with a tail call when it has native code; terminates the current block
     void emit_resume_ci();
     // tail calls generated code at its first instruction, for a frame that was just set up
@@ -149,17 +164,34 @@ public:
         return m_speculate && type == expected;
     }
 
+    bool profiling() const
+    {
+        return m_profiling;
+    }
+
     // branch weights for a condition that is true on the fast path, and for one that is true on a cold path
     llvm::MDNode* likely();
     llvm::MDNode* unlikely();
 
     llvm::BasicBlock* new_block(const llvm::Twine& name);
     llvm::BasicBlock* block_at(int pcpos);
+    // the rest of the bytecode block continues in its generic copy from here, like it does after a helper call, so a
+    // rare path doesn't merge into the fast copy
+    void mark_slow_path();
+    // whether reg holds a table that NEWTABLE or DUPTABLE created earlier in the bytecode block of pcpos
+    bool holds_new_table(int reg, int pcpos) const;
 
     void mark_entry_point(int pcpos);
 
     llvm::BasicBlock* vm_exit(int pcpos);
     llvm::BasicBlock* yield_exit();
+
+    // ors 'bits' into the feedback of the instruction
+    void emit_feedback_bits(int pcpos, llvm::Value* bits);
+    // the integer loop that the FORNPREP or FORNLOOP at pcpos belongs to, or null
+    const IntegerLoop* integer_loop(int pcpos) const;
+    // the feedback that the code this compilation replaces gathered for the instruction
+    uint32_t feedback_at(int pcpos) const;
 
 private:
     void emit_prologue();
@@ -179,8 +211,20 @@ private:
 
     void emit_vm_exit(int pcpos, llvm::BasicBlock* block);
     void emit_counter(uint64_t* counter);
+    // records the tags of the operands that feedback_operands lists for the instruction
+    void emit_type_feedback(int pcpos);
+    void emit_operand_feedback(int pcpos, int slot);
+    // every way into the loop at 'header' but the back edge of its fast copy goes through this block: it checks the tags
+    // that the first block of the loop guards with exits, so that the loop knows them from its first instruction on
+    llvm::BasicBlock* loop_pad(int header);
+    // counts down the tier-up budget at the start of the function or at a back edge, and switches the frame over to the
+    // replacement code at the same pc once there is one
+    void emit_tier_up(int pcpos);
 
     void compute_dirty_regs();
+    void find_integer_loops();
+    // rebuilds the counters of the integer loops around an entry point from their index registers
+    void emit_integer_loop_entry(int pcpos);
     DeoptPoint build_deopt_point(int pcpos) const;
 
     NativeProto& m_nproto;
@@ -193,6 +237,10 @@ private:
     llvm::Module& m_module;
     JitCounters* m_counters = nullptr;
     bool m_speculate = false;
+    // baseline code records operand types for the tiers above it
+    bool m_profiling = false;
+    // code below the top tier counts down to the next one
+    bool m_tiersUp = false;
     llvm::IRBuilder<> m_builder;
     llvm::Function* m_function = nullptr;
     llvm::BasicBlock* m_entryBlock = nullptr;
@@ -222,6 +270,13 @@ private:
     // registers that may differ from their stack slot when the instruction starts
     std::vector<std::bitset<256>> m_dirtyIn;
     std::vector<std::bitset<256>> m_liveIn;
+
+    std::vector<IntegerLoop> m_integerLoops;
+    // the targets of backward jumps, and their pads (null when the loop guards nothing)
+    std::vector<bool> m_loopHeaders;
+    std::unordered_map<int, llvm::BasicBlock*> m_loopPads;
+    // the instruction being translated, -1 outside of one
+    int m_pcpos = -1;
 };
 
 struct TypedOperand
@@ -252,6 +307,7 @@ void lower_inst_gettable(TranslationUnit& unit, const Instruction* pc, int pcpos
 void lower_inst_settable(TranslationUnit& unit, const Instruction* pc, int pcpos);
 void lower_inst_gettablen(TranslationUnit& unit, const Instruction* pc, int pcpos);
 void lower_inst_settablen(TranslationUnit& unit, const Instruction* pc, int pcpos);
+void lower_inst_newtable(TranslationUnit& unit, const Instruction* pc, int pcpos);
 void lower_inst_call(TranslationUnit& unit, const Instruction* pc, int pcpos);
 void lower_inst_return(TranslationUnit& unit, const Instruction* pc, int pcpos);
 void lower_inst_jump(TranslationUnit& unit, const Instruction* pc, int pcpos);
